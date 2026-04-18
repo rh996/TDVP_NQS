@@ -1,0 +1,59 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions / compiled binaries
+*.so
+*.dylib
+*.dll
+*.o
+*.a
+
+# Build / packaging
+build/
+dist/
+site/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+wheels/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# JAX / XLA artifacts (if generated locally)
+*.hlo
+*.pb
+*.xla
+jax_dump/
+xla_dump/
+xla_cache/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
