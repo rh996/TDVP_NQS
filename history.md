@@ -134,22 +134,60 @@
 
 ---
 
-## Validation snapshot (after Phase 1–3)
+## 2026-04-18 — Phase 4: TDVP Residual Loss Review + Unit Test Validation
+
+### What changed
+
+- Reviewed `src/loss.py` implementation against the Phase 4 specification in `Program.md`.
+- Confirmed implemented APIs and formulas:
+  - `time_derivatives_autodiff(...)`
+  - `tdvp_residual_components(...)`
+  - `tdvp_residual_loss(...)`
+- Confirmed residual definitions are implemented as:
+  - `A_n = 0.5 * d_t logp_n - Im[E_loc]_n`
+  - `B_n = d_t phi_n + Re[E_loc]_n`
+  - `ell_n = (A_n - mean(A))^2 + (B_n - mean(B))^2`
+  - `L_hat = mean(ell_n)`
+- Added comprehensive unit tests in `tests/test_loss_phase4.py`:
+  - autodiff time derivatives match closed-form dummy model values
+  - residual components (`A`, `B`) match manual analytic construction
+  - centered-variance loss matches manual computation
+  - diagnostics payload fields (`A`, `B`, `A_mean`, `B_mean`, `ell`, `dlogp_dt`, `dphi_dt`, `e_real`, `e_imag`) are validated
+  - `return_diagnostics=False` path returns finite scalar
+  - identical-sample batch gives zero centered variance loss
+  - input validation for shape/length/binary-domain errors
+
+### Why
+
+- Phase 4 requires explicit and test-backed implementation of local residual statistics and Monte Carlo loss estimator.
+- This review ensures the implemented equations in code match the theory section and are robust to common data-shape/data-domain failures.
+- Strong tests on analytic toy cases reduce risk before Phase 5 gradient estimator work.
+
+### Expected impact
+
+- `src/loss.py` is now review-verified and unit-tested for the Phase 4 milestone objective.
+- Residual/loss computations are now safer to use as a dependency for gradient estimation in `src/grad.py`.
+- Faster debugging and regression detection for future refactors in loss/Hamiltonian interfaces.
+
+---
+
+## Validation snapshot (after Phase 1–4)
 
 - Unit tests currently passing for implemented phases:
   - wavefunction phase-1 API tests
   - hamiltonian phase-2 logic tests
   - sampler phase-3 tests
-- Current test status at update time:
-  - all tests in suite passed (`18 passed`).
+  - loss phase-4 tests
+- Current phase-4 test status at update time:
+  - `tests/test_loss_phase4.py`: all tests passed (`6 passed`).
 
 ---
 
 ## Notes for next phase
 
-- Next target: **Phase 4** (`src/loss.py`)
-  - compute per-sample residual components `A_n`, `B_n`
-  - use `local_energy_batch(...)`
-  - output scalar centered-variance loss and useful diagnostics.
-- Then **Phase 5** (`src/grad.py`)
-  - implement pathwise gradient + covariance correction.
+- Next target: **Phase 5** (`src/grad.py`)
+  - implement pathwise gradient term on fixed samples
+  - implement sampling-measure covariance correction using score function `∂_θ log p`
+  - combine to full practical VMC gradient estimator with sanity checks.
+- Then **Phase 6** (`src/TDVP.py`)
+  - wire sampler → loss → gradient → optimizer step loop and logging.
