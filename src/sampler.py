@@ -1,0 +1,160 @@
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+import jax
+import jax.numpy as jnp
+
+from src.wavefunction import Wavefunction
+
+
+@dataclass
+class SamplerStats:
+    """Diagnostics returned by the Metropolis sampler."""
+
+    acceptance_rate: jnp.ndarray  # shape: (n_chains,)
+    proposed_moves: int
+    accepted_moves: jnp.ndarray  # shape: (n_chains,)
+
+
+def _as_batched_configs(configurations: jnp.ndarray, n_sites: int) -> jnp.ndarray:
+    """Normalize configurations to shape (n_chains, n_sites)."""
+    configs = jnp.asarray(configurations).astype(jnp.int32)
+
+    if configs.ndim == 1:
+        if configs.shape[0] != n_sites:
+            raise ValueError(
+                f"Expected 1D configuration length {n_sites}, got {configs.shape[0]}"
+            )
+        configs = configs[jnp.newaxis, :]
+    elif configs.ndim == 2:
+        if configs.shape[1] != n_sites:
+            raise ValueError(
+                f"Expected 2D configurations second dim {n_sites}, got {configs.shape[1]}"
+            )
+    else:
+        raise ValueError(
+            f"Expected configurations of rank 1 or 2, got shape {configs.shape}"
+        )
+
+    if not jnp.all((configs == 0) | (configs == 1)):
+        raise ValueError("Configurations must be binary bits in {0,1}.")
+
+    return configs
+
+
+def _log_prob_batch(wf: Wavefunction, configs: jnp.ndarray, t) -> jnp.ndarray:
+    """Evaluate log-probability for a batch of configurations."""
+    logp = wf.log_prob(configs, t)
+    logp = jnp.asarray(logp)
+    if logp.ndim == 0:
+        return logp[jnp.newaxis]
+    if logp.ndim == 1:
+        return logp
+    if logp.ndim == 2 and logp.shape[-1] == 1:
+        return jnp.squeeze(logp, axis=-1)
+    raise ValueError(f"Unexpected log_prob output shape: {logp.shape}")
+
+
+def _mh_step(
+    wf: Wavefunction,
+    configs: jnp.ndarray,
+    logp_current: jnp.ndarray,
+    t,
+    key: jax.Array,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """One vectorized MH step over all chains."""
+    n_chains, n_sites = configs.shape
+    key_site, key_u = jax.random.split(key)
+
+    # Propose one spin flip per chain.
+    flip_sites = jax.random.randint(
+        key_site, shape=(n_chains,), minval=0, maxval=n_sites
+    )
+    rows = jnp.arange(n_chains)
+    proposed = configs.at[rows, flip_sites].set(1 - configs[rows, flip_sites])
+
+    # Acceptance ratio for target p(sigma) ∝ exp(logp(sigma)).
+    logp_proposed = _log_prob_batch(wf, proposed, t)
+    log_alpha = logp_proposed - logp_current
+
+    # Accept if log(u) < log_alpha.
+    u = jax.random.uniform(key_u, shape=(n_chains,), minval=0.0, maxval=1.0)
+    accept = jnp.log(u) < jnp.minimum(log_alpha, 0.0)
+
+    new_configs = jnp.where(accept[:, None], proposed, configs)
+    new_logp = jnp.where(accept, logp_proposed, logp_current)
+    return new_configs, new_logp, accept
+
+
+def metropolis_hastings_sample(
+    wf: Wavefunction,
+    initial_configurations: jnp.ndarray,
+    t,
+    *,
+    n_sites: int,
+    n_samples: int,
+    burn_in: int = 100,
+    thinning: int = 1,
+    key: Optional[jax.Array] = None,
+    return_stats: bool = True,
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+    """Sample from p_theta(sigma,t) ∝ exp(logp_theta(sigma,t)) via MH.
+
+    Args:
+        wf: Wavefunction object exposing `log_prob(configurations, t)`.
+        initial_configurations: shape (N,) or (C, N), bits in {0,1}.
+        t: Time input passed to the wavefunction.
+        n_sites: Number of spin sites (N).
+        n_samples: Number of retained samples per chain after burn-in/thinning.
+        burn_in: Number of initial MH steps to discard.
+        thinning: Keep one sample every `thinning` MH steps.
+        key: PRNG key. If None, a default deterministic key is used.
+        return_stats: Whether to return diagnostics.
+
+    Returns:
+        samples: shape (C, n_samples, N), where C is number of chains.
+        stats: diagnostics dictionary with acceptance metrics.
+    """
+    if n_samples <= 0:
+        raise ValueError(f"n_samples must be > 0, got {n_samples}")
+    if burn_in < 0:
+        raise ValueError(f"burn_in must be >= 0, got {burn_in}")
+    if thinning <= 0:
+        raise ValueError(f"thinning must be > 0, got {thinning}")
+
+    configs = _as_batched_configs(initial_configurations, n_sites)
+    n_chains = configs.shape[0]
+    total_steps = burn_in + n_samples * thinning
+
+    if key is None:
+        key = jax.random.PRNGKey(0)
+
+    logp = _log_prob_batch(wf, configs, t)
+
+    collected = []
+    accepted_count = jnp.zeros((n_chains,), dtype=jnp.int32)
+
+    for step in range(total_steps):
+        key, step_key = jax.random.split(key)
+        configs, logp, accept = _mh_step(wf, configs, logp, t, step_key)
+        accepted_count = accepted_count + accept.astype(jnp.int32)
+
+        if step >= burn_in and ((step - burn_in) % thinning == 0):
+            collected.append(configs)
+
+    samples = jnp.stack(collected, axis=1)  # (C, n_samples, N)
+
+    if not return_stats:
+        return samples, {}
+
+    acceptance_rate = accepted_count.astype(jnp.float32) / float(total_steps)
+    stats = {
+        "acceptance_rate": acceptance_rate,
+        "accepted_moves": accepted_count,
+        "proposed_moves": jnp.asarray(total_steps, dtype=jnp.int32),
+        "n_chains": jnp.asarray(n_chains, dtype=jnp.int32),
+        "n_samples_per_chain": jnp.asarray(n_samples, dtype=jnp.int32),
+        "burn_in": jnp.asarray(burn_in, dtype=jnp.int32),
+        "thinning": jnp.asarray(thinning, dtype=jnp.int32),
+    }
+    return samples, stats
