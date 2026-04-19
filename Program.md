@@ -136,6 +136,23 @@ Phase 7 — Validation and Benchmarking
 Deliverable:
 - Confidence that implementation is numerically stable and physically consistent.
 
+Phase 8 — Checkpointed Wavefunction Reuse and Observable Measurement
+1. Save trained neural-network state:
+   - serialize the wavefunction parameters after training.
+   - save enough metadata to reconstruct the model architecture and Hamiltonian settings.
+2. Resume / reload wavefunction:
+   - load saved parameters into a fresh `tSpinNQS` instance.
+   - support continuing training from a checkpointed wavefunction state.
+3. Measure observables after training:
+   - estimate `⟨Z(t)⟩` and/or `⟨X(t)⟩` from Monte Carlo samples drawn from the trained wavefunction.
+   - define clearly whether `⟨Z(t)⟩` means site-averaged magnetization, total magnetization, or another convention.
+4. Add tests / validation:
+   - save → load → forward-pass consistency checks.
+   - observable sanity checks on small systems or analytically simple wavefunctions.
+
+Deliverable:
+- A workflow that can train, save, reload, resume, and evaluate physically meaningful observables such as `⟨Z(t)⟩` and `⟨X(t)⟩`.
+
 Immediate Next Tasks (Concrete Priority Queue)
 
 1. Fix `tSpinNQS` parameter persistence bug (highest priority).
@@ -144,6 +161,8 @@ Immediate Next Tasks (Concrete Priority Queue)
 4. Implement `loss.py` for `A_n`, `B_n`, and `\hat L`.
 5. Implement `grad.py` with pathwise + covariance estimator.
 6. Wire everything in `TDVP.py` and run a minimal training experiment.
+7. Add checkpoint save/load support for the trained wavefunction.
+8. Implement post-training measurement of observables such as `⟨Z(t)⟩` and `⟨X(t)⟩`.
 
 Definition of Done (Minimal Objective Aligned)
 

@@ -49,6 +49,10 @@ jax_dump/
 xla_dump/
 xla_cache/
 
+# Local plotting / example outputs
+.mpl-cache/
+example/outputs*/
+
 # macOS
 .DS_Store
 

@@ -312,3 +312,220 @@
 - Phase-5 gradients are now genuinely sensitive to wavefunction parameters.
 - Phase-6 training diagnostics now report nonzero gradient norms on the deterministic toy run.
 - The test suite now guards against this specific “unused differentiand” failure mode.
+
+---
+
+## 2026-04-18 — Phase 6 Follow-up: Persistent MCMC Chains Across Training Steps
+
+### What changed
+
+- Updated `src/TDVP.py` so training no longer restarts every Markov chain from the all-zero state on each optimization step:
+  - added explicit chain-state validation for shape `(n_chains, N)` and binary domain `{0,1}`.
+  - `train_step(...)` now accepts optional `initial_configurations` and returns `next_chain_configurations`.
+  - `train_loop(...)` now carries chain configurations forward from one step to the next and returns the final chain states in `final_configurations`.
+- Added Phase-6 regression tests in `tests/test_tdvp_phase6.py`:
+  - verifies `train_step(...)` returns valid next chain states.
+  - verifies `train_step(...)` actually uses the provided initial chain state.
+  - verifies `train_loop(...)` preserves chain continuity across successive optimization steps.
+
+### Why
+
+- Restarting every chain at the same fixed configuration each step breaks the intended Monte Carlo process in `Program.md`, where the sampled batch should approximate draws from the current Born distribution.
+- Persisting chains across optimization steps makes the sampler a warm-started MCMC process instead of a sequence of repeated transient chains.
+
+### Expected impact
+
+- The sampling process is now materially closer to the basic VMC mathematics described in `Program.md`.
+- Training batches should better approximate samples from the current model distribution for a fixed sampler budget.
+- The code now has regression coverage for chain persistence, which was previously only an assumption.
+
+---
+
+## 2026-04-18 — Example: Fully Polarized Chain Training Run
+
+### What changed
+
+- Extended `TrainingConfig` in `src/TDVP.py` with optional `initial_chain_configurations`:
+  - allows `train_loop(...)` to start Markov chains from an explicitly chosen spin configuration instead of the default zero state.
+  - validates shape `(n_chains, N)` and binary domain `{0,1}` during config validation.
+- Added `example/train_fully_polarized_chain.py`:
+  - starts all chains from a fully polarized bitstring state (`all ones`).
+  - runs TDVP training for `10000` steps.
+  - plots the recorded loss history with Matplotlib and saves it under `example/outputs/fully_polarized_loss.png`.
+  - sets `MPLCONFIGDIR` to a writable project-local cache directory for reliable Matplotlib execution.
+- Added a Phase-6 regression test ensuring `train_loop(...)` accepts explicit initial chain configurations.
+
+### Why
+
+- The requested example needs a visible way to initialize the sampling process from a fully polarized spin chain.
+- Making the initializer part of `TrainingConfig` is cleaner than reimplementing the training loop inside the example script.
+
+### Expected impact
+
+- The repository now contains a concrete end-to-end example that matches the requested workflow:
+  - fully polarized initial spin chain
+  - long TDVP optimization run
+  - loss visualization with Matplotlib
+
+---
+
+## 2026-04-18 — Phase 8: Save/Load/Resume and Observable Measurement
+
+### What changed
+
+- Extended `src/TDVP.py` with real checkpointed training-state support:
+  - added `save_training_checkpoint(...)` to serialize model parameters, Hamiltonian metadata, config, RNG, chain states, and metrics history.
+  - added `load_training_checkpoint(...)` to reconstruct a fresh `tSpinNQS` instance and restore its saved parameters.
+  - expanded `train_loop(...)` to accept an initial wavefunction / Hamiltonian / RNG / metrics / chain state / start-time index for resume workflows.
+  - periodic checkpoints now write `.pkl` files containing actual reloadable training state rather than metadata-only JSON.
+- Added `src/observables.py`:
+  - `measure_observables(...)` to estimate total and site-averaged `⟨Z⟩` and `⟨X⟩` from sampled configurations.
+  - `sample_and_measure_observables(...)` to run the sampler and return observable estimates plus sampler diagnostics.
+  - `exact_observables_from_wf(...)` and `normalized_statevector(...)` for exact small-system validation by exhaustive enumeration.
+- Added new tests:
+  - `tests/test_phase8_checkpoint.py` for save/load consistency, checkpoint file creation, and resume-from-checkpoint continuation.
+  - `tests/test_phase8_observables.py` for observable formulas and exact small-system checks.
+
+### Why
+
+- The remaining roadmap items required a practical way to preserve a trained wavefunction and use it later without retraining from scratch.
+- Observable measurement is the bridge from “the optimizer runs” to “the trained state predicts physics”.
+- Exact small-system enumeration gives a clean validation target for the new observable code.
+
+### Expected impact
+
+- The codebase now supports the full save → load → resume workflow for trained wavefunctions.
+- Post-training measurement of `⟨Z(t)⟩` and `⟨X(t)⟩` is available directly from Monte Carlo samples.
+- Small-system exact checks are now available to validate observable calculations.
+
+---
+
+## 2026-04-18 — Example: Train, Save, Reload, Resume, Measure
+
+### What changed
+
+- Added `example/train_save_reload_measure.py`:
+  - trains a wavefunction from a fully polarized spin chain.
+  - saves a checkpoint with `save_training_checkpoint(...)`.
+  - reloads the checkpoint with `load_training_checkpoint(...)`.
+  - optionally resumes optimization for additional TDVP steps.
+  - measures Monte Carlo `⟨Z⟩` and `⟨X⟩` after training.
+  - computes exact `⟨Z⟩` / `⟨X⟩` by enumeration for small systems.
+  - writes:
+    - a loss plot,
+    - `observables.json`,
+    - `summary.json`,
+    - checkpoint files in the example output directory.
+
+### Why
+
+- The codebase now has the Phase-8 machinery, but users still need a concrete script that demonstrates the intended workflow end to end.
+- A worked example makes the save/load/resume and observable APIs much easier to verify and reuse.
+
+### Expected impact
+
+- The repository now includes an executable Phase-8 example that demonstrates the full post-training analysis workflow rather than only the training loop.
+
+---
+
+## 2026-04-18 — Optimizer Upgrade: AdamW in TDVP Training
+
+### What changed
+
+- Replaced the manual SGD-style parameter update in `src/TDVP.py` with a real `optax.adamw` optimizer.
+- Extended `TrainingConfig` with AdamW hyperparameters:
+  - `optimizer_name`
+  - `adamw_b1`
+  - `adamw_b2`
+  - `adamw_eps`
+  - `weight_decay`
+- Updated `train_step(...)` and `train_loop(...)` to carry optimizer state explicitly through training.
+- Extended checkpoint save/load so AdamW state is serialized and restored on resume.
+- Updated tests and the save/reload example to resume with the restored optimizer state.
+
+### Why
+
+- The previous update rule was plain gradient descent, which wastes the optimizer-state information usually needed for stable TDVP/VMC training.
+- Resume-from-checkpoint should preserve optimizer moments, not just model weights, otherwise the resumed run silently changes optimization dynamics.
+
+### Expected impact
+
+- Training now uses AdamW rather than bare SGD.
+- Checkpointed runs resume with consistent optimizer dynamics.
+- The optimizer path is structured so a later Muon option can be added cleanly without reworking the training loop again.
+
+---
+
+## 2026-04-18 — Examples Updated for Explicit AdamW Usage
+
+### What changed
+
+- Updated `example/train_fully_polarized_chain.py` to set `optimizer_name="adamw"` explicitly.
+- Added AdamW CLI knobs to the example scripts:
+  - `--learning-rate`
+  - `--weight-decay`
+  - `--adamw-b1`
+  - `--adamw-b2`
+  - `--adamw-eps`
+- Updated example console output, plot titles, and saved metadata so the optimizer choice is visible rather than implicit.
+- Updated `example/train_save_reload_measure.py` to record AdamW settings in `observables.json` and `summary.json`.
+
+### Why
+
+- The training loop now supports AdamW explicitly, so the examples should document that choice directly instead of relying on default config values.
+- Saved outputs are easier to interpret when the optimizer hyperparameters are recorded alongside the run.
+
+### Expected impact
+
+- Example runs now make the optimizer configuration explicit and reproducible.
+- Future optimizer comparisons, including a later Muon path, will be easier because the examples already surface optimizer settings at the CLI and in output files.
+
+---
+
+## 2026-04-18 — Joint Time-Loss Training
+
+### What changed
+
+- Changed the default TDVP training mode in `src/TDVP.py` from serial per-time optimization to a summed time-loss objective.
+- Added `TrainingConfig.time_loss_mode` with values:
+  - `sum` for a single optimizer update over all time slices
+  - `serial` to keep the previous per-time-step update behavior
+- Reworked `train_loop(...)` so the default path:
+  - evaluates every time slice with the same model parameters
+  - sums the time-local losses
+  - accumulates the time-slice gradients
+  - applies one AdamW update per outer training step
+- Kept chain continuation and checkpointing working in both modes.
+- Updated the phase-6 test to expect one metric entry per optimizer step in summed-loss mode.
+
+### Why
+
+- Serial updates across time slices can change earlier time slices before the full trajectory has been evaluated.
+- Summing the time-local losses matches the intended objective more directly and keeps all time slices coupled to the same parameter snapshot during each update.
+
+### Expected impact
+
+- Default training now optimizes a joint objective over the whole time window.
+- The previous serial behavior is still available for comparison or debugging.
+- Loss history now reflects optimizer steps, not optimizer steps multiplied by the number of time slices, when `time_loss_mode="sum"`.
+
+---
+
+## 2026-04-18 — Examples Updated for Joint Time-Loss Mode
+
+### What changed
+
+- Updated `example/train_fully_polarized_chain.py` to set `time_loss_mode="sum"` explicitly.
+- Updated `example/train_save_reload_measure.py` to set `time_loss_mode="sum"` explicitly.
+- Printed the time-loss mode alongside the AdamW hyperparameters at startup.
+- Recorded `time_loss_mode` in the saved observables and summary metadata for the save/reload example.
+
+### Why
+
+- The examples should reflect the actual training semantics used by the codebase after the joint time-loss change.
+- Making the mode explicit prevents confusion between the old serial time-stepping behavior and the new summed objective.
+
+### Expected impact
+
+- Example scripts now clearly advertise that they use the joint loss across time slices.
+- Saved example artifacts now include enough metadata to reproduce the exact training objective used in the run.
