@@ -9,8 +9,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+try:
+    from optax.contrib import muon as optax_muon
+except ImportError:  # pragma: no cover - depends on optax version
+    optax_muon = None
 
-from src.grad import _tree_add, tdvp_vmc_gradient
+from src.grad import _tree_add, tdvp_vmc_gradient, _ModelWavefunctionView
 from src.hamiltonian import TransverseIsingHamiltonian
 from src.loss import tdvp_residual_loss
 from src.sampler import metropolis_hastings_sample
@@ -77,9 +81,9 @@ def _validate_training_config(config: TrainingConfig) -> None:
         )
     if config.learning_rate <= 0:
         raise ValueError(f"learning_rate must be > 0, got {config.learning_rate}")
-    if config.optimizer_name != "adamw":
+    if config.optimizer_name.lower() not in ("adamw", "muon"):
         raise ValueError(
-            f"Unsupported optimizer_name {config.optimizer_name!r}; only 'adamw' is currently supported."
+            f"Unsupported optimizer_name {config.optimizer_name!r}; only 'adamw' and 'muon' are currently supported."
         )
     if not 0.0 <= config.adamw_b1 < 1.0:
         raise ValueError(f"adamw_b1 must be in [0, 1), got {config.adamw_b1}")
@@ -135,8 +139,9 @@ def _validate_chain_configurations(
         raise ValueError(
             f"Expected chain configurations shape ({n_chains}, {n_sites}), got {configs.shape}"
         )
-    if not jnp.all((configs == 0) | (configs == 1)):
-        raise ValueError("Chain configurations must be binary bits in {0,1}.")
+    if not isinstance(configs, jax.core.Tracer):
+        if not jnp.all((configs == 0) | (configs == 1)):
+            raise ValueError("Chain configurations must be binary bits in {0,1}.")
     return configs
 
 
@@ -161,7 +166,8 @@ def _default_metrics_history() -> Dict[str, list]:
 
 def _create_optimizer(config: TrainingConfig) -> optax.GradientTransformation:
     """Build the optimizer configured for TDVP training."""
-    if config.optimizer_name == "adamw":
+    optimizer_name = config.optimizer_name.lower()
+    if optimizer_name == "adamw":
         return optax.adamw(
             learning_rate=config.learning_rate,
             b1=config.adamw_b1,
@@ -169,8 +175,27 @@ def _create_optimizer(config: TrainingConfig) -> optax.GradientTransformation:
             eps=config.adamw_eps,
             weight_decay=config.weight_decay,
         )
+    if optimizer_name == "muon":
+        if optax_muon is None:
+            raise RuntimeError(
+                "Muon optimizer is not available in the installed optax package."
+            )
+        return optax_muon(
+            learning_rate=config.learning_rate,
+            ns_coeffs="standard",
+            ns_steps=5,
+            beta=0.95,
+            eps=config.adamw_eps,
+            weight_decay=config.weight_decay,
+            adam_b1=config.adamw_b1,
+            adam_b2=config.adamw_b2,
+            adam_eps_root=config.adamw_eps,
+            adam_weight_decay=config.weight_decay,
+            muon_weight_dimension_numbers=None,
+            consistent_rms=0.2,
+        )
     raise ValueError(
-        f"Unsupported optimizer_name {config.optimizer_name!r}; only 'adamw' is currently supported."
+        f"Unsupported optimizer_name {config.optimizer_name!r}; only 'adamw' and 'muon' are currently supported."
     )
 
 
@@ -493,7 +518,62 @@ def train_loop(
             n_sites=ham.N,
         )
 
+    # Distribute chains across CPU/TPU cores using JAX SPMD.
+    from jax.sharding import Mesh, PartitionSpec, NamedSharding
+    
+    n_devices = jax.device_count()
+    if config.n_chains % n_devices != 0:
+        # Fallback to single-device mesh if chains can't be evenly distributed
+        mesh_devices = [jax.devices()[0]]
+    else:
+        mesh_devices = jax.devices()
+        
+    mesh = Mesh(mesh_devices, axis_names=('chains',))
+    sharding = NamedSharding(mesh, PartitionSpec('chains'))
+    chain_configurations = jax.device_put(chain_configurations, sharding)
+
     time_indices = list(range(start_time_index, config.time_steps))
+
+    @nnx.jit
+    def jitted_eval_slice(model, t_val, rng_val, init_configs):
+        wf_view = _ModelWavefunctionView(model)
+        return _evaluate_time_slice(
+            wf=wf_view,
+            ham=ham,
+            t=t_val,
+            config=config,
+            rng=rng_val,
+            initial_configurations=init_configs,
+        )
+
+    @nnx.jit
+    def jitted_opt_update(model, opt_st, grad_state):
+        return _apply_optimizer_update(
+            model=model,
+            optimizer=optimizer,
+            opt_state=opt_st,
+            grad_state=grad_state,
+        )
+
+    @nnx.jit
+    def jitted_train_step(model, t_val, rng_val, init_configs, opt_st):
+        wf_view = _ModelWavefunctionView(model)
+        loss_val, diag_val, grad_total, new_rng, next_configs = _evaluate_time_slice(
+            wf=wf_view,
+            ham=ham,
+            t=t_val,
+            config=config,
+            rng=rng_val,
+            initial_configurations=init_configs,
+        )
+        opt_st = _apply_optimizer_update(
+            model=model,
+            optimizer=optimizer,
+            opt_state=opt_st,
+            grad_state=grad_total,
+        )
+        return loss_val, diag_val, opt_st, new_rng, next_configs
+
     if config.time_loss_mode == "serial":
         for t_idx in time_indices:
             t = times[t_idx]
@@ -505,15 +585,8 @@ def train_loop(
             for local_step in range(config.n_steps):
                 rng, step_rng = jax.random.split(rng)
 
-                loss, diag, opt_state, rng, chain_configurations = train_step(
-                    wf=wf,
-                    ham=ham,
-                    t=float(t),
-                    config=config,
-                    optimizer=optimizer,
-                    opt_state=opt_state,
-                    rng=step_rng,
-                    initial_configurations=chain_configurations,
+                loss, diag, opt_state, rng, chain_configurations = jitted_train_step(
+                    wf.model, float(t), step_rng, chain_configurations, opt_state
                 )
 
                 for key in metrics_history.keys():
@@ -577,15 +650,8 @@ def train_loop(
             for t_idx in time_indices:
                 t = times[t_idx]
                 rng, step_rng = jax.random.split(rng)
-                loss, diag, grad_slice, rng, step_chain_configurations = (
-                    _evaluate_time_slice(
-                        wf=wf,
-                        ham=ham,
-                        t=float(t),
-                        config=config,
-                        rng=step_rng,
-                        initial_configurations=step_chain_configurations,
-                    )
+                loss, diag, grad_slice, rng, step_chain_configurations = jitted_eval_slice(
+                    wf.model, float(t), step_rng, step_chain_configurations
                 )
 
                 loss_total = loss_total + loss
@@ -605,9 +671,8 @@ def train_loop(
                 e_real_means.append(jnp.asarray(diag["e_real_mean"]))
                 e_imag_means.append(jnp.asarray(diag["e_imag_mean"]))
 
-            opt_state = _apply_optimizer_update(
+            opt_state = jitted_opt_update(
                 wf.model,
-                optimizer,
                 opt_state,
                 grad_total,
             )

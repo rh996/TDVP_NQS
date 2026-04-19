@@ -64,8 +64,9 @@ def _validate_batch_configs(configurations: jnp.ndarray, n_sites: int) -> jnp.nd
         raise ValueError(
             f"Expected configuration length N={n_sites}, got {configs.shape[1]}"
         )
-    if not jnp.all((configs == 0) | (configs == 1)):
-        raise ValueError("Configurations must be binary bits in {0,1}.")
+    if not isinstance(configs, jax.core.Tracer):
+        if not jnp.all((configs == 0) | (configs == 1)):
+            raise ValueError("Configurations must be binary bits in {0,1}.")
     return configs
 
 
@@ -77,14 +78,6 @@ def _tree_add(a: PyTree, b: PyTree) -> PyTree:
 def _tree_scale(tree: PyTree, scalar: jnp.ndarray) -> PyTree:
     """Scale a pytree by a scalar."""
     return jax.tree_util.tree_map(lambda x: x * scalar, tree)
-
-
-def _tree_mean(trees_list: List[PyTree]) -> PyTree:
-    """Average a list of pytrees leaf-wise."""
-    if not trees_list:
-        raise ValueError("Cannot compute mean of empty pytree list.")
-    stacked = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *trees_list)
-    return jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), stacked)
 
 
 def _tree_l2_norm(tree: PyTree) -> jnp.ndarray:
@@ -137,26 +130,21 @@ def _per_sample_score_grads(
     wf: Wavefunction,
     configurations: jnp.ndarray,
     t,
-) -> List[PyTree]:
+) -> PyTree:
     """Compute per-sample score gradients g_n = ∂_θ log p(σ_n, t).
 
-    Uses a Python loop (not vmap) to avoid NNX trace-level aliasing issues.
-    Returns a list of gradient pytrees, one per sample.
+    Uses nnx.vmap to compute gradients for the batch efficiently.
+    Returns a single gradient pytree where each leaf has a leading batch dimension.
     """
     import flax.nnx as nnx
 
-    grads_list = []
-    for i in range(configurations.shape[0]):
-        cfg_i = configurations[i]
+    def logp_fn(m, cfg_i):
+        model_wf = _ModelWavefunctionView(m)
+        return _as_scalar_like(model_wf.log_prob(cfg_i, t), "log_prob")
 
-        def logp_fn(m):
-            model_wf = _ModelWavefunctionView(m)
-            return _as_scalar_like(model_wf.log_prob(cfg_i, t), "log_prob")
-
-        grad_i = nnx.grad(logp_fn)(wf.model)
-        grads_list.append(grad_i)
-
-    return grads_list
+    grad_fn = nnx.grad(logp_fn)
+    vmap_grad_fn = nnx.vmap(grad_fn, in_axes=(None, 0))
+    return vmap_grad_fn(wf.model, configurations)
 
 
 def tdvp_vmc_gradient(
@@ -197,26 +185,24 @@ def tdvp_vmc_gradient(
     ell_centered = ell - ell_mean
 
     # 3) Per-sample score gradients g_n = ∂θ log p_n.
-    score_grads_list = _per_sample_score_grads(wf, configs, t)
-    score_mean = _tree_mean(score_grads_list)
+    score_grads_batched = _per_sample_score_grads(wf, configs, t)
+    score_mean = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), score_grads_batched)
 
     # 4) Center score gradients leaf-wise.
-    score_centered_list = [
-        jax.tree_util.tree_map(lambda g, gm: g - gm, g, score_mean)
-        for g in score_grads_list
-    ]
+    score_centered_batched = jax.tree_util.tree_map(
+        lambda g, gm: g - gm, score_grads_batched, score_mean
+    )
 
     # 5) Covariance correction: mean_n [ ell_c[n] * score_c[n] ].
     # For each parameter leaf, compute: mean_n [ ell_centered[n] * score_centered[n] ]
     grad_cov = jax.tree_util.tree_map(
-        lambda *score_leaves: jnp.mean(
-            jnp.stack(score_leaves, axis=0)
-            * ell_centered.reshape(
-                (ell_centered.shape[0],) + (1,) * score_leaves[0].ndim
+        lambda score_c: jnp.mean(
+            score_c * ell_centered.reshape(
+                (ell_centered.shape[0],) + (1,) * (score_c.ndim - 1)
             ),
             axis=0,
         ),
-        *score_centered_list,
+        score_centered_batched,
     )
 
     # 6) Total gradient.
@@ -292,23 +278,21 @@ def tdvp_vmc_gradient_components(
     ell_mean = jnp.mean(ell)
     ell_centered = ell - ell_mean
 
-    score_grads_list = _per_sample_score_grads(wf, configs, t)
-    score_mean = _tree_mean(score_grads_list)
+    score_grads_batched = _per_sample_score_grads(wf, configs, t)
+    score_mean = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), score_grads_batched)
 
-    score_centered_list = [
-        jax.tree_util.tree_map(lambda g, gm: g - gm, g, score_mean)
-        for g in score_grads_list
-    ]
+    score_centered_batched = jax.tree_util.tree_map(
+        lambda g, gm: g - gm, score_grads_batched, score_mean
+    )
 
     grad_cov = jax.tree_util.tree_map(
-        lambda *score_leaves: jnp.mean(
-            jnp.stack(score_leaves, axis=0)
-            * ell_centered.reshape(
-                (ell_centered.shape[0],) + (1,) * score_leaves[0].ndim
+        lambda score_c: jnp.mean(
+            score_c * ell_centered.reshape(
+                (ell_centered.shape[0],) + (1,) * (score_c.ndim - 1)
             ),
             axis=0,
         ),
-        *score_centered_list,
+        score_centered_batched,
     )
     grad_total = _tree_add(grad_pathwise, grad_cov)
 

@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from src.TDVP import TrainingConfig, train_loop, train_step
+from src.TDVP import TrainingConfig, _create_optimizer, train_loop, train_step
 from src.hamiltonian import TransverseIsingHamiltonian
 from src.sampler import metropolis_hastings_sample
 from src.wavefunction import tSpinNQS
@@ -45,13 +45,7 @@ def _make_wf_and_ham(config: TrainingConfig):
 def test_train_step_returns_finite_metrics_and_next_rng():
     config = _make_config()
     wf, ham = _make_wf_and_ham(config)
-    optimizer = optax.adamw(
-        learning_rate=config.learning_rate,
-        b1=config.adamw_b1,
-        b2=config.adamw_b2,
-        eps=config.adamw_eps,
-        weight_decay=config.weight_decay,
-    )
+    optimizer = _create_optimizer(config)
     opt_state = optimizer.init(nnx.state(wf.model, nnx.Param))
     rng = jax.random.PRNGKey(123)
 
@@ -271,3 +265,15 @@ def test_train_step_uses_provided_chain_state():
 
     assert jnp.array_equal(next_rng, expected_rng)
     assert jnp.array_equal(next_configs, expected_samples[:, -1, :])
+
+
+def test_train_loop_supports_muon_optimizer():
+    config = _make_config()
+    config.optimizer_name = "muon"
+    config.n_steps = 1
+    config.time_steps = 1
+    result = train_loop(config, verbose=False)
+
+    assert result["optimizer"] is not None
+    assert result["opt_state"] is not None
+    assert len(result["metrics_history"]["loss"]) == 1

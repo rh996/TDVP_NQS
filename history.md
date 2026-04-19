@@ -529,3 +529,59 @@
 
 - Example scripts now clearly advertise that they use the joint loss across time slices.
 - Saved example artifacts now include enough metadata to reproduce the exact training objective used in the run.
+
+---
+
+## 2026-04-18 — Muon Optimizer Support
+
+### What changed
+
+- Added `optax.contrib.muon` support to `src/TDVP.py`.
+- Extended the optimizer factory so `TrainingConfig.optimizer_name` now accepts:
+  - `adamw`
+  - `muon`
+- Kept the existing AdamW hyperparameters as the Adam fallback controls inside Muon:
+  - `adamw_b1`
+  - `adamw_b2`
+  - `adamw_eps`
+  - `weight_decay`
+- Updated both example scripts to accept `--optimizer-name`, so Muon can be selected from the command line.
+- Added regression coverage for:
+  - Muon training
+  - Muon checkpoint round-trip
+  - Muon example runs
+
+### Why
+
+- The upgraded `optax` release exposes Muon under `optax.contrib`, which makes it available without adding a new dependency.
+- Muon is most useful when it is selectable from the same training loop and checkpoint path as AdamW.
+
+### Expected impact
+
+- The project now supports a second optimizer family for comparison against AdamW.
+- Muon can be used directly in examples and in checkpointed training runs.
+- The code remains forward-compatible with adding more optimizer choices later without rewriting the training loop again.
+
+---
+
+## 2026-04-18 — Performance Optimizations: JIT, SPMD, and Fast Loops
+
+### What changed
+
+- Refactored `_per_sample_score_grads` in `src/grad.py` to use `nnx.vmap` instead of a Python `for` loop, enabling efficient batched gradient estimation without trace-level aliasing list overheads.
+- Rewrote the Metropolis-Hastings sampling loop in `src/sampler.py` using `jax.lax.scan` to prevent XLA from unrolling massive computational graphs during extensive sampling and thinning.
+- Introduced `@nnx.jit` wrappers (`jitted_eval_slice`, `jitted_opt_update`, `jitted_train_step`) into `src/TDVP.py` to fully compile the training sequence.
+- Added JAX SPMD `NamedSharding` across the `chain_configurations` batch axis in `src/TDVP.py` to automatically parallelize execution over available CPU/TPU devices.
+- Added `jax.core.Tracer` bypasses for boolean validation checks in `src/grad.py`, `src/loss.py`, `src/observables.py`, `src/sampler.py`, and `src/TDVP.py` to allow JIT compilation over batched operations.
+- Added command-line arguments for time integration (`--time-steps`, `--t-initial`, `--t-final`) to `example/train_fully_polarized_chain.py`.
+
+### Why
+
+- Eliminating Python `for` loops inside JAX boundaries drastically reduces graph compilation overhead and memory bloat.
+- JIT compiling the training steps brings execution speed to TPU-ready XLA performance.
+- SPMD sharding natively utilizes multi-core hardware (like 8-core TPU VMs) by distributing concurrent Markov chains without complex Pmap setup.
+
+### Expected impact
+
+- Massively improved training speed, seamlessly scaling to large batch evaluations (e.g., 100,000+ MH proposals per step) in seconds.
+- Multi-device TPU distribution works instantly by simply requesting multiples of the device count for the `n_chains` parameter.

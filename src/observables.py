@@ -32,8 +32,9 @@ def _validate_batch_configs(configurations: jnp.ndarray, n_sites: int) -> jnp.nd
         raise ValueError(
             f"Expected configuration length N={n_sites}, got {configs.shape[1]}"
         )
-    if not jnp.all((configs == 0) | (configs == 1)):
-        raise ValueError("Configurations must be binary bits in {0,1}.")
+    if not isinstance(configs, jax.core.Tracer):
+        if not jnp.all((configs == 0) | (configs == 1)):
+            raise ValueError("Configurations must be binary bits in {0,1}.")
     return configs
 
 

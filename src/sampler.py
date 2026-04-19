@@ -36,8 +36,9 @@ def _as_batched_configs(configurations: jnp.ndarray, n_sites: int) -> jnp.ndarra
             f"Expected configurations of rank 1 or 2, got shape {configs.shape}"
         )
 
-    if not jnp.all((configs == 0) | (configs == 1)):
-        raise ValueError("Configurations must be binary bits in {0,1}.")
+    if not isinstance(configs, jax.core.Tracer):
+        if not jnp.all((configs == 0) | (configs == 1)):
+            raise ValueError("Configurations must be binary bits in {0,1}.")
 
     return configs
 
@@ -131,22 +132,32 @@ def metropolis_hastings_sample(
 
     logp = _log_prob_batch(wf, configs, t)
 
-    collected = []
-    accepted_count = jnp.zeros((n_chains,), dtype=jnp.int32)
+    def scan_body(carry, _):
+        k, c_configs, c_logp, c_acc = carry
+        k, step_key = jax.random.split(k)
+        new_configs, new_logp, accept = _mh_step(wf, c_configs, c_logp, t, step_key)
+        return (k, new_configs, new_logp, c_acc + accept.astype(jnp.int32)), None
 
-    for step in range(total_steps):
-        key, step_key = jax.random.split(key)
-        configs, logp, accept = _mh_step(wf, configs, logp, t, step_key)
-        accepted_count = accepted_count + accept.astype(jnp.int32)
+    carry = (key, configs, logp, jnp.zeros((n_chains,), dtype=jnp.int32))
+    
+    # 1. Burn-in steps
+    carry, _ = jax.lax.scan(scan_body, carry, None, length=burn_in)
+    
+    # 2. Sampling steps
+    def sample_body(carry, _):
+        carry, _ = jax.lax.scan(scan_body, carry, None, length=thinning)
+        # carry[1] is the new_configs
+        return carry, carry[1]
 
-        if step >= burn_in and ((step - burn_in) % thinning == 0):
-            collected.append(configs)
-
-    samples = jnp.stack(collected, axis=1)  # (C, n_samples, N)
+    carry, samples = jax.lax.scan(sample_body, carry, None, length=n_samples)
+    
+    # Swap axes from (n_samples, n_chains, N) to (n_chains, n_samples, N)
+    samples = jnp.swapaxes(samples, 0, 1)
 
     if not return_stats:
         return samples, {}
 
+    accepted_count = carry[3]
     acceptance_rate = accepted_count.astype(jnp.float32) / float(total_steps)
     stats = {
         "acceptance_rate": acceptance_rate,

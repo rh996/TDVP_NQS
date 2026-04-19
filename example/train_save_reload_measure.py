@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-sites", type=int, default=4)
     parser.add_argument("--n-chains", type=int, default=2)
     parser.add_argument("--measure-samples", type=int, default=32)
+    parser.add_argument("--optimizer-name", type=str, default="adamw")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--adamw-b1", type=float, default=0.9)
@@ -89,8 +90,8 @@ def main() -> None:
         emb_dim=16,
         num_heads=2,
         head_dim=8,
+        optimizer_name=args.optimizer_name,
         learning_rate=args.learning_rate,
-        optimizer_name="adamw",
         adamw_b1=args.adamw_b1,
         adamw_b2=args.adamw_b2,
         adamw_eps=args.adamw_eps,
@@ -110,7 +111,7 @@ def main() -> None:
     )
 
     print(
-        "Running TDVP with AdamW: "
+        f"Running TDVP with {config.optimizer_name.upper()}: "
         f"lr={config.learning_rate}, "
         f"weight_decay={config.weight_decay}, "
         f"b1={config.adamw_b1}, "
@@ -240,7 +241,9 @@ def main() -> None:
     plt.plot(metrics["step"], metrics["loss"], linewidth=1.5)
     plt.xlabel("Training Step")
     plt.ylabel("TDVP Loss")
-    plt.title("Train → Save → Reload → Measure Workflow (AdamW)")
+    plt.title(
+        f"Train → Save → Reload → Measure Workflow ({resumed['config'].optimizer_name.upper()})"
+    )
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(loss_plot_path, dpi=150)

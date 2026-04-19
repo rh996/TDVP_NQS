@@ -27,11 +27,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-steps", type=int, default=10000)
     parser.add_argument("--n-sites", type=int, default=10)
     parser.add_argument("--n-chains", type=int, default=4)
+    parser.add_argument("--optimizer-name", type=str, default="adamw")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--adamw-b1", type=float, default=0.9)
     parser.add_argument("--adamw-b2", type=float, default=0.999)
     parser.add_argument("--adamw-eps", type=float, default=1e-8)
+    parser.add_argument("--n-samples-per-chain", type=int, default=16)
+    parser.add_argument("--thinning", type=int, default=1)
+    parser.add_argument("--t-initial", type=float, default=0.0)
+    parser.add_argument("--t-final", type=float, default=0.0)
+    parser.add_argument("--time-steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "example" / "outputs")
     return parser.parse_args()
@@ -54,28 +60,28 @@ def main() -> None:
         emb_dim=16,
         num_heads=2,
         head_dim=8,
+        optimizer_name=args.optimizer_name,
         learning_rate=args.learning_rate,
-        optimizer_name="adamw",
         adamw_b1=args.adamw_b1,
         adamw_b2=args.adamw_b2,
         adamw_eps=args.adamw_eps,
         weight_decay=args.weight_decay,
         n_steps=args.n_steps,
-        n_samples_per_chain=16,
+        n_samples_per_chain=args.n_samples_per_chain,
         burn_in=50,
-        thinning=1,
+        thinning=args.thinning,
         n_chains=n_chains,
         initial_chain_configurations=fully_polarized,
-        t_initial=0.0,
-        t_final=0.0,
-        time_steps=1,
+        t_initial=args.t_initial,
+        t_final=args.t_final,
+        time_steps=args.time_steps,
         time_loss_mode="sum",
         checkpoint_dir=None,
         seed=args.seed,
     )
 
     print(
-        "Running TDVP with AdamW: "
+        f"Running TDVP with {config.optimizer_name.upper()}: "
         f"lr={config.learning_rate}, "
         f"weight_decay={config.weight_decay}, "
         f"b1={config.adamw_b1}, "
@@ -95,7 +101,9 @@ def main() -> None:
     plt.plot(steps, loss_values, linewidth=1.5)
     plt.xlabel("Training Step")
     plt.ylabel("TDVP Loss")
-    plt.title("TDVP Training From a Fully Polarized Spin Chain (AdamW)")
+    plt.title(
+        f"TDVP Training From a Fully Polarized Spin Chain ({config.optimizer_name.upper()})"
+    )
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(figure_path, dpi=150)

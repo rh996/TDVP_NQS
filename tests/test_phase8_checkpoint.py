@@ -131,3 +131,31 @@ def test_train_loop_writes_real_checkpoint_files(tmp_path: Path):
     ckpt2 = tmp_path / "checkpoint_t002.pkl"
     assert ckpt1.exists()
     assert ckpt2.exists()
+
+
+def test_muon_optimizer_state_roundtrip(tmp_path: Path):
+    config = _make_config()
+    config.optimizer_name = "muon"
+    config.n_steps = 1
+    config.time_steps = 1
+
+    result = train_loop(config, verbose=False)
+
+    checkpoint_path = tmp_path / "muon_checkpoint.pkl"
+    save_training_checkpoint(
+        str(checkpoint_path),
+        wf=result["wavefunction"],
+        ham=result["hamiltonian"],
+        config=result["config"],
+        metrics_history=result["metrics_history"],
+        global_step=result["global_step"],
+        completed_time_steps=result["completed_time_steps"],
+        current_time=0.0,
+        chain_configurations=result["final_configurations"],
+        rng=result["rng"],
+        opt_state=result["opt_state"],
+    )
+
+    loaded = load_training_checkpoint(str(checkpoint_path))
+    assert loaded["optimizer_state"] is not None
+    assert loaded["config"].optimizer_name == "muon"
