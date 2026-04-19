@@ -248,3 +248,67 @@
   - validation against exact diagonalization on small systems.
   - ablation studies (number of boxes, head dimensions, sampler settings).
   - stability analysis (multiple seeds, gradient clipping, optimizer tuning).
+
+---
+
+## 2026-04-18 — Phase 6: TDVP Training Driver Repair + Tests
+
+### What changed
+
+- Repaired `src/TDVP.py` so the training driver now uses a single consistent update path:
+  - retained manual gradient-descent parameter updates on the live NNX model.
+  - removed broken references to undefined `optimizer` / `opt_state` variables.
+  - fixed `train_step(...)` to return `(loss, diagnostics, next_rng)` consistently.
+- Added explicit training-config validation:
+  - checks for positive `N`, `n_steps`, `time_steps`, `learning_rate`, `n_chains`, and `n_samples_per_chain`.
+  - checks for valid `burn_in` and `thinning`.
+- Added real energy diagnostics to the training step:
+  - computes `e_real_mean` and `e_imag_mean` from `tdvp_residual_loss(...)` diagnostics instead of silently defaulting to zeros.
+  - records `finite_loss` and `finite_grads` in the training metrics history.
+- Fixed the runnable example in `src/TDVP.py`:
+  - removed the nonexistent `optimizer_name` config argument.
+  - preserved result keys with `optimizer=None` and `opt_state=None` to keep the return payload stable while the driver still uses manual updates.
+- Added `tests/test_tdvp_phase6.py` covering:
+  - finite `train_step(...)` outputs and diagnostics.
+  - `train_loop(...)` metric-history recording.
+  - configuration validation failures.
+
+### Why
+
+- `src/TDVP.py` had drifted into an inconsistent half-refactor:
+  - undefined variables made the driver unrunnable.
+  - the example entrypoint could not construct `TrainingConfig`.
+  - energy diagnostics were misleading because they always collapsed to zero.
+- Phase 6 needs a training loop that is actually executable before any optimizer upgrade or physics benchmarking is meaningful.
+
+### Expected impact
+
+- The training driver can now run end-to-end on small systems using the existing sampler/loss/gradient stack.
+- Regressions in the training loop are now covered by tests instead of only by manual inspection.
+- Logged metrics are more trustworthy for debugging sampler behavior and TDVP stability.
+
+---
+
+## 2026-04-18 — Phase 5 Follow-up: Nonzero Gradient Bug Fix
+
+### What changed
+
+- Repaired `src/grad.py` so `nnx.grad(...)` differentiates through the model argument it receives:
+  - added a `_ModelWavefunctionView` adapter that exposes `__call__`, `log_prob`, and `phase` on top of an arbitrary model instance.
+  - updated the pathwise loss closure to evaluate `tdvp_residual_loss(...)` through that adapter instead of closing over `wf.model`.
+  - updated per-sample score-gradient closures to evaluate `log_prob` through the differentiand model `m` rather than the outer `wf`.
+- Strengthened `tests/test_grad_phase5.py`:
+  - gradient norms must now be strictly positive for the fixed deterministic toy setup.
+  - added an explicit regression test that checks `grad_total`, `grad_pathwise`, and `grad_cov` all depend on model parameters.
+
+### Why
+
+- The previous closures accepted a model argument but never used it.
+- That made the gradient estimator structurally zero while still passing the older finiteness-only tests.
+- The zero gradient then propagated into `src/TDVP.py`, where training appeared to run but never actually updated parameters meaningfully.
+
+### Expected impact
+
+- Phase-5 gradients are now genuinely sensitive to wavefunction parameters.
+- Phase-6 training diagnostics now report nonzero gradient norms on the deterministic toy run.
+- The test suite now guards against this specific “unused differentiand” failure mode.

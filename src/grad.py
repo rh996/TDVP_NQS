@@ -27,6 +27,32 @@ class GradientDiagnostics:
     finite_grads: jnp.ndarray
 
 
+class _ModelWavefunctionView(Wavefunction):
+    """Wavefunction adapter that evaluates through a provided NNX model."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def __call__(self, configuration, t):
+        logp, phi = self.model(configuration, t)
+        return self._squeeze_last_dim(logp), self._squeeze_last_dim(phi)
+
+    def log_prob(self, configuration, t):
+        logp, _ = self(configuration, t)
+        return logp
+
+    def phase(self, configuration, t):
+        _, phi = self(configuration, t)
+        return phi
+
+    @staticmethod
+    def _squeeze_last_dim(x: jnp.ndarray) -> jnp.ndarray:
+        arr = jnp.asarray(x)
+        if arr.ndim > 1 and arr.shape[-1] == 1:
+            return jnp.squeeze(arr, axis=-1)
+        return arr
+
+
 def _validate_batch_configs(configurations: jnp.ndarray, n_sites: int) -> jnp.ndarray:
     """Validate (B, N) binary configurations."""
     configs = jnp.asarray(configurations).astype(jnp.int32)
@@ -124,7 +150,8 @@ def _per_sample_score_grads(
         cfg_i = configurations[i]
 
         def logp_fn(m):
-            return _as_scalar_like(wf.log_prob(cfg_i, t), "log_prob")
+            model_wf = _ModelWavefunctionView(m)
+            return _as_scalar_like(model_wf.log_prob(cfg_i, t), "log_prob")
 
         grad_i = nnx.grad(logp_fn)(wf.model)
         grads_list.append(grad_i)
@@ -158,7 +185,8 @@ def tdvp_vmc_gradient(
 
     # 1) Pathwise gradient on fixed sample batch.
     def loss_for_grad(m):
-        return _batch_loss_fn(ham, wf, configs, t)
+        model_wf = _ModelWavefunctionView(m)
+        return _batch_loss_fn(ham, model_wf, configs, t)
 
     grad_pathwise = nnx.grad(loss_for_grad)(wf.model)
 
@@ -254,7 +282,8 @@ def tdvp_vmc_gradient_components(
     configs = _validate_batch_configs(configurations, ham.N)
 
     def loss_for_grad(m):
-        return _batch_loss_fn(ham, wf, configs, t)
+        model_wf = _ModelWavefunctionView(m)
+        return _batch_loss_fn(ham, model_wf, configs, t)
 
     grad_pathwise = nnx.grad(loss_for_grad)(wf.model)
 

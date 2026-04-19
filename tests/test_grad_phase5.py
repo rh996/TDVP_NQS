@@ -91,7 +91,9 @@ def test_tdvp_vmc_gradient_returns_nonempty_finite_pytree_and_diagnostics():
     assert bool(diag["finite_loss"])
     assert bool(diag["finite_grads"])
     assert jnp.isfinite(diag["grad_norm_total"])
-    assert float(diag["grad_norm_total"]) >= 0.0
+    assert float(diag["grad_norm_total"]) > 0.0
+    assert float(diag["grad_norm_pathwise"]) > 0.0
+    assert float(diag["grad_norm_covariance"]) > 0.0
 
 
 def test_tdvp_vmc_gradient_without_diagnostics():
@@ -172,6 +174,24 @@ def test_tdvp_vmc_gradient_loss_matches_phase4_loss():
     )
 
     assert jnp.allclose(diag["loss"], loss_phase4, atol=1e-6)
+
+
+def test_tdvp_vmc_gradient_depends_on_model_parameters():
+    ham = TransverseIsingHamiltonian(J=1.0, h=0.7, N=5)
+    wf = _make_wf(N=5, seed=5)
+    configs = _make_configs()
+    t = jnp.float32(0.2)
+
+    grad_total, grad_pathwise, grad_cov, _ = tdvp_vmc_gradient_components(
+        ham=ham,
+        wf=wf,
+        configurations=configs,
+        t=t,
+    )
+
+    assert float(_tree_l2_norm(grad_total)) > 0.0
+    assert float(_tree_l2_norm(grad_pathwise)) > 0.0
+    assert float(_tree_l2_norm(grad_cov)) > 0.0
 
 
 def test_tdvp_vmc_gradient_input_validation_shape_length_binary():
