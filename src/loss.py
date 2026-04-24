@@ -8,6 +8,7 @@ from src.hamiltonian import TransverseIsingHamiltonian, local_energy_batch
 from src.wavefunction import Wavefunction
 
 
+@jax.tree_util.register_pytree_node_class
 @dataclass
 class LossDiagnostics:
     """Diagnostics returned with TDVP residual loss."""
@@ -21,6 +22,25 @@ class LossDiagnostics:
     dphi_dt: jnp.ndarray
     e_real: jnp.ndarray
     e_imag: jnp.ndarray
+
+    def tree_flatten(self):
+        children = (
+            self.A,
+            self.B,
+            self.A_mean,
+            self.B_mean,
+            self.ell,
+            self.dlogp_dt,
+            self.dphi_dt,
+            self.e_real,
+            self.e_imag,
+        )
+        aux_data = None
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
 
 
 def _validate_batch_configs(configurations: jnp.ndarray, n_sites: int) -> jnp.ndarray:
@@ -57,18 +77,20 @@ def _time_derivatives_single(
     configuration: jnp.ndarray,
     t: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Per-sample autodiff time derivatives d_t logp and d_t phi."""
+    """Per-sample autodiff time derivatives d_t logp and d_t phi.
+
+    Optimized to use jax.jvp (Forward-mode AD) to compute derivatives of both
+    outputs in a single forward pass of the neural network.
+    """
     cfg = jnp.asarray(configuration).astype(jnp.int32)
     t = jnp.asarray(t, dtype=jnp.float32)
 
-    def logp_at_time(tt):
-        return _as_scalar_like(wf.log_prob(cfg, tt), "log_prob")
+    def wf_at_time(tt):
+        logp, phi = wf(cfg, tt)
+        return _as_scalar_like(logp, "logp"), _as_scalar_like(phi, "phi")
 
-    def phi_at_time(tt):
-        return _as_scalar_like(wf.phase(cfg, tt), "phase")
-
-    dlogp_dt = jax.grad(logp_at_time)(t)
-    dphi_dt = jax.grad(phi_at_time)(t)
+    # jax.jvp computes (f(x), df/dx * v). By setting v=1.0, we get the derivatives directly.
+    _, (dlogp_dt, dphi_dt) = jax.jvp(wf_at_time, (t,), (jnp.ones_like(t),))
     return dlogp_dt, dphi_dt
 
 

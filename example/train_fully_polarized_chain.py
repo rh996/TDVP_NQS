@@ -1,10 +1,15 @@
 import argparse
-from pathlib import Path
 import os
 import sys
+from pathlib import Path
 
+import flax.nnx as nnx
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 
+from src.grad import _ModelWavefunctionView
+from src.observables import sample_and_measure_observables
+from src.TDVP import TrainingConfig, train_loop
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -13,10 +18,6 @@ if str(ROOT) not in sys.path:
 # Keep Matplotlib cache in a writable project-local temp directory.
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".mpl-cache"))
 
-import matplotlib.pyplot as plt
-
-from src.TDVP import TrainingConfig, train_loop
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -24,8 +25,8 @@ def parse_args() -> argparse.Namespace:
             "Train TDVP from a fully polarized spin chain with AdamW and plot the loss."
         )
     )
-    parser.add_argument("--n-steps", type=int, default=10000)
-    parser.add_argument("--n-sites", type=int, default=10)
+    parser.add_argument("--n-steps", type=int, default=200)
+    parser.add_argument("--n-sites", type=int, default=4)
     parser.add_argument("--n-chains", type=int, default=4)
     parser.add_argument("--optimizer-name", type=str, default="adamw")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -33,11 +34,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adamw-b1", type=float, default=0.9)
     parser.add_argument("--adamw-b2", type=float, default=0.999)
     parser.add_argument("--adamw-eps", type=float, default=1e-8)
-    parser.add_argument("--n-samples-per-chain", type=int, default=16)
-    parser.add_argument("--thinning", type=int, default=1)
+    parser.add_argument("--n-samples-per-chain", type=int, default=1000)
+    parser.add_argument("--thinning", type=int, default=10)
     parser.add_argument("--t-initial", type=float, default=0.0)
     parser.add_argument("--t-final", type=float, default=0.0)
     parser.add_argument("--time-steps", type=int, default=1)
+    parser.add_argument("--pretrain-steps", type=int, default=100)
+    parser.add_argument("--pretrain-lr", type=float, default=0.005)
+    parser.add_argument("--lambda-ic", type=float, default=10.0)
+    parser.add_argument(
+        "--target-site",
+        type=int,
+        default=0,
+        help="Site index for per-site observables.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "example" / "outputs")
     return parser.parse_args()
@@ -54,10 +64,10 @@ def main() -> None:
 
     config = TrainingConfig(
         N=n_sites,
-        J=1.0,
+        J=-1.0,
         h=0.5,
         Num_boxes=2,
-        emb_dim=16,
+        emb_dim=32,
         num_heads=2,
         head_dim=8,
         optimizer_name=args.optimizer_name,
@@ -75,7 +85,9 @@ def main() -> None:
         t_initial=args.t_initial,
         t_final=args.t_final,
         time_steps=args.time_steps,
-        time_loss_mode="sum",
+        pretrain_steps=args.pretrain_steps,
+        pretrain_lr=args.pretrain_lr,
+        lambda_ic=args.lambda_ic,
         checkpoint_dir=None,
         seed=args.seed,
     )
@@ -87,7 +99,8 @@ def main() -> None:
         f"b1={config.adamw_b1}, "
         f"b2={config.adamw_b2}, "
         f"eps={config.adamw_eps}, "
-        f"time_loss_mode={config.time_loss_mode}"
+        f"pretrain_steps={config.pretrain_steps}, "
+        f"lambda_ic={config.lambda_ic}"
     )
 
     result = train_loop(config, verbose=True)
@@ -110,6 +123,66 @@ def main() -> None:
     plt.close()
 
     print(f"Saved loss curve to {figure_path}")
+
+    # --- Measure and Plot Observables ---
+    print(f"\nMeasuring observables for site {args.target_site}...")
+    wf = result["wavefunction"]
+    import jax
+
+    times = jnp.linspace(config.t_initial, config.t_final, config.time_steps)
+    z_values = []
+    x_values = []
+
+    # Use a dummy initial configuration for the first measurement
+    obs_configs = jnp.zeros((config.n_chains, config.N), dtype=jnp.int32)
+
+    @nnx.jit
+    def jitted_measure(model, t_val, configs, key):
+        wf_view = _ModelWavefunctionView(model)
+        return sample_and_measure_observables(
+            wf=wf_view,
+            t=t_val,
+            n_sites=config.N,
+            initial_configurations=configs,
+            n_samples=config.n_samples_per_chain,
+            burn_in=config.burn_in,
+            thinning=config.thinning,
+            key=key,
+        )
+
+    for t_val in times:
+        rng, measure_rng = jax.random.split(jax.random.PRNGKey(args.seed))
+        obs_est, _, obs_configs = jitted_measure(
+            wf.model, float(t_val), obs_configs, measure_rng
+        )
+        z_values.append(float(obs_est.z_sites[args.target_site]))
+        x_values.append(float(obs_est.x_sites_real[args.target_site]))
+
+    # Plot Z(t)
+    z_figure_path = output_dir / "z_trajectory.png"
+    plt.figure(figsize=(9, 5))
+    plt.plot(times, z_values, "o-", linewidth=1.5, markersize=4, color="tab:blue")
+    plt.xlabel("Time t")
+    plt.ylabel(f"<Z_{args.target_site + 1}(t)>")
+    plt.title(f"Magnetization Trajectory Z_{args.target_site + 1}(t) (N={config.N})")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(z_figure_path, dpi=150)
+    plt.close()
+    print(f"Saved Z(t) plot to {z_figure_path}")
+
+    # Plot X(t)
+    x_figure_path = output_dir / "x_trajectory.png"
+    plt.figure(figsize=(9, 5))
+    plt.plot(times, x_values, "o-", linewidth=1.5, markersize=4, color="tab:orange")
+    plt.xlabel("Time t")
+    plt.ylabel(f"<X_{args.target_site + 1}(t)>")
+    plt.title(f"Magnetization Trajectory X_{args.target_site + 1}(t) (N={config.N})")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(x_figure_path, dpi=150)
+    plt.close()
+    print(f"Saved X(t) plot to {x_figure_path}")
 
 
 if __name__ == "__main__":

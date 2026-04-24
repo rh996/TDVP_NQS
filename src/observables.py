@@ -3,11 +3,13 @@ from typing import Dict, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import flax.nnx as nnx
 
 from src.sampler import metropolis_hastings_sample
 from src.wavefunction import Wavefunction
 
 
+@jax.tree_util.register_pytree_node_class
 @dataclass
 class ObservableEstimates:
     """Monte Carlo or exact expectation values of simple spin observables."""
@@ -18,7 +20,30 @@ class ObservableEstimates:
     x_total_imag: jnp.ndarray
     x_mean_real: jnp.ndarray
     x_mean_imag: jnp.ndarray
+    # Per-site observables
+    z_sites: jnp.ndarray  # shape: (N,)
+    x_sites_real: jnp.ndarray  # shape: (N,)
+    x_sites_imag: jnp.ndarray  # shape: (N,)
     n_samples: int
+
+    def tree_flatten(self):
+        children = (
+            self.z_total,
+            self.z_mean,
+            self.x_total_real,
+            self.x_total_imag,
+            self.x_mean_real,
+            self.x_mean_imag,
+            self.z_sites,
+            self.x_sites_real,
+            self.x_sites_imag,
+        )
+        aux_data = self.n_samples
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children, n_samples=aux_data)
 
 
 def _validate_batch_configs(configurations: jnp.ndarray, n_sites: int) -> jnp.ndarray:
@@ -44,12 +69,12 @@ def _bit_to_sz(configurations: jnp.ndarray) -> jnp.ndarray:
     return 1 - 2 * configs
 
 
-def _local_x_total_single(
+def _local_x_sites_single(
     wf: Wavefunction,
     configuration: jnp.ndarray,
     t,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Local estimator for total X = sum_i sigma_i^x on one configuration."""
+    """Local estimators for sigma_i^x for each site i on one configuration."""
     config = jnp.asarray(configuration).astype(jnp.int32)
     if config.ndim != 1:
         raise ValueError(f"Expected 1D configuration, got {config.shape}")
@@ -69,8 +94,8 @@ def _local_x_total_single(
         magnitude = jnp.exp(jnp.clip(0.5 * delta_logp, min=-40.0, max=40.0))
         return magnitude * jnp.cos(delta_phi), magnitude * jnp.sin(delta_phi)
 
-    real_terms, imag_terms = jax.vmap(single_site)(jnp.arange(config.shape[0]))
-    return jnp.sum(real_terms), jnp.sum(imag_terms)
+    real_sites, imag_sites = jax.vmap(single_site)(jnp.arange(config.shape[0]))
+    return real_sites, imag_sites
 
 
 def measure_observables(
@@ -85,16 +110,28 @@ def measure_observables(
     Convention:
       - Z uses sigma^z eigenvalues s_i = 1 - 2 * bit_i.
       - Returned `z_mean` and `x_mean_*` are site averages, i.e. total / N.
+      - Per-site values are returned in `z_sites`, `x_sites_real`, etc.
     """
     configs = _validate_batch_configs(configurations, n_sites)
-    z_total_per_sample = jnp.sum(_bit_to_sz(configs).astype(jnp.float32), axis=1)
-    x_total_real_per_sample, x_total_imag_per_sample = jax.vmap(
-        lambda cfg: _local_x_total_single(wf, cfg, t)
+    
+    # Per-site, per-sample: (B, N)
+    z_per_site_per_sample = _bit_to_sz(configs).astype(jnp.float32)
+    
+    # (B, N), (B, N)
+    x_sites_real_per_sample, x_sites_imag_per_sample = jax.vmap(
+        lambda cfg: _local_x_sites_single(wf, cfg, t)
     )(configs)
 
-    z_total = jnp.mean(z_total_per_sample)
-    x_total_real = jnp.mean(x_total_real_per_sample)
-    x_total_imag = jnp.mean(x_total_imag_per_sample)
+    # Average over batch dimension (B)
+    z_sites = jnp.mean(z_per_site_per_sample, axis=0)
+    x_sites_real = jnp.mean(x_sites_real_per_sample, axis=0)
+    x_sites_imag = jnp.mean(x_sites_imag_per_sample, axis=0)
+
+    # Total and mean (site-averaged)
+    z_total = jnp.sum(z_sites)
+    x_total_real = jnp.sum(x_sites_real)
+    x_total_imag = jnp.sum(x_sites_imag)
+    
     n_sites_f = float(n_sites)
 
     return ObservableEstimates(
@@ -104,6 +141,9 @@ def measure_observables(
         x_total_imag=x_total_imag,
         x_mean_real=x_total_real / n_sites_f,
         x_mean_imag=x_total_imag / n_sites_f,
+        z_sites=z_sites,
+        x_sites_real=x_sites_real,
+        x_sites_imag=x_sites_imag,
         n_samples=int(configs.shape[0]),
     )
 
@@ -153,8 +193,9 @@ def enumerate_binary_configurations(n_sites: int) -> jnp.ndarray:
 def normalized_statevector(wf: Wavefunction, n_sites: int, t) -> jnp.ndarray:
     """Enumerate and normalize the wavefunction amplitudes for small systems."""
     configs = enumerate_binary_configurations(n_sites)
-    logp = jnp.asarray(wf.log_prob(configs, t), dtype=jnp.float32)
-    phi = jnp.asarray(wf.phase(configs, t), dtype=jnp.float32)
+    logp, phi = wf(configs, t)
+    logp = jnp.asarray(logp, dtype=jnp.float32)
+    phi = jnp.asarray(phi, dtype=jnp.float32)
 
     if logp.ndim == 2 and logp.shape[-1] == 1:
         logp = jnp.squeeze(logp, axis=-1)
@@ -178,22 +219,36 @@ def exact_observables_from_wf(
     configs = enumerate_binary_configurations(n_sites)
     probabilities = jnp.abs(psi) ** 2
 
-    z_total_values = jnp.sum(_bit_to_sz(configs).astype(jnp.float32), axis=1)
-    z_total = jnp.sum(probabilities * z_total_values)
+    # Per-site Z: sum over all states weighted by prob
+    z_per_site_all_states = _bit_to_sz(configs).astype(jnp.float32)  # (2^N, N)
+    z_sites = jnp.sum(probabilities[:, None] * z_per_site_all_states, axis=0)
+    z_total = jnp.sum(z_sites)
 
+    # Per-site X
     basis_indices = jnp.arange(2**n_sites, dtype=jnp.int32)
-    x_total = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex64)
+    x_sites_complex = []
     for site in range(n_sites):
         flipped_indices = basis_indices ^ (1 << (n_sites - 1 - site))
-        x_total = x_total + jnp.vdot(psi, psi[flipped_indices])
+        x_i = jnp.vdot(psi, psi[flipped_indices])
+        x_sites_complex.append(x_i)
+    
+    x_sites_complex = jnp.stack(x_sites_complex)
+    x_sites_real = jnp.real(x_sites_complex)
+    x_sites_imag = jnp.imag(x_sites_complex)
+    
+    x_total_real = jnp.sum(x_sites_real)
+    x_total_imag = jnp.sum(x_sites_imag)
 
     n_sites_f = float(n_sites)
     return ObservableEstimates(
-        z_total=jnp.real(z_total),
-        z_mean=jnp.real(z_total) / n_sites_f,
-        x_total_real=jnp.real(x_total),
-        x_total_imag=jnp.imag(x_total),
-        x_mean_real=jnp.real(x_total) / n_sites_f,
-        x_mean_imag=jnp.imag(x_total) / n_sites_f,
+        z_total=z_total,
+        z_mean=z_total / n_sites_f,
+        x_total_real=x_total_real,
+        x_total_imag=x_total_imag,
+        x_mean_real=x_total_real / n_sites_f,
+        x_mean_imag=x_total_imag / n_sites_f,
+        z_sites=z_sites,
+        x_sites_real=x_sites_real,
+        x_sites_imag=x_sites_imag,
         n_samples=int(2**n_sites),
     )

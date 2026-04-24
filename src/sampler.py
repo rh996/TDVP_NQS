@@ -45,7 +45,7 @@ def _as_batched_configs(configurations: jnp.ndarray, n_sites: int) -> jnp.ndarra
 
 def _log_prob_batch(wf: Wavefunction, configs: jnp.ndarray, t) -> jnp.ndarray:
     """Evaluate log-probability for a batch of configurations."""
-    logp = wf.log_prob(configs, t)
+    logp, _ = wf(configs, t)
     logp = jnp.asarray(logp)
     if logp.ndim == 0:
         return logp[jnp.newaxis]
@@ -169,3 +169,67 @@ def metropolis_hastings_sample(
         "thinning": jnp.asarray(thinning, dtype=jnp.int32),
     }
     return samples, stats
+
+
+def metropolis_hastings_trajectory(
+    wf: Wavefunction,
+    initial_configurations: jnp.ndarray,
+    times: jnp.ndarray,
+    *,
+    n_sites: int,
+    n_samples: int,
+    burn_in: int = 100,
+    thinning: int = 1,
+    key: Optional[jax.Array] = None,
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray], jnp.ndarray]:
+    """Sample across a sequence of times, carrying the Markov chain forward.
+
+    This ensures 'warm starting' where each time slice starts from the
+    thermalized state of the previous time slice.
+
+    Args:
+        wf: Wavefunction object.
+        initial_configurations: Starting bits (C, N).
+        times: Array of time points (T,).
+        n_sites: N.
+        n_samples: Samples per chain per time point.
+        burn_in: Initial burn-in for the FIRST time point.
+        thinning: MCMC thinning.
+        key: RNG key.
+
+    Returns:
+        all_samples: shape (T, C, n_samples, N)
+        all_stats: Dictionary of diagnostics over time.
+        final_configs: shape (C, N) from the last time point.
+    """
+    if key is None:
+        key = jax.random.PRNGKey(0)
+
+    configs = _as_batched_configs(initial_configurations, n_sites)
+
+    def time_step_scan(carry, t):
+        k, current_configs = carry
+        k_step, k_next = jax.random.split(k)
+
+        # For the first time step, we use the provided burn_in.
+        # For subsequent steps, we could theoretically reduce it, but
+        # for simplicity and correctness, we keep it consistent.
+        samples, stats = metropolis_hastings_sample(
+            wf=wf,
+            initial_configurations=current_configs,
+            t=t,
+            n_sites=n_sites,
+            n_samples=n_samples,
+            burn_in=burn_in,
+            thinning=thinning,
+            key=k_step,
+            return_stats=True,
+        )
+        next_configs = samples[:, -1, :]
+        return (k_next, next_configs), (samples, stats)
+
+    (_, final_configs), (all_samples, all_stats) = jax.lax.scan(
+        time_step_scan, (key, configs), times
+    )
+
+    return all_samples, all_stats, final_configs

@@ -9,15 +9,24 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+
 try:
     from optax.contrib import muon as optax_muon
 except ImportError:  # pragma: no cover - depends on optax version
     optax_muon = None
 
-from src.grad import _tree_add, tdvp_vmc_gradient, _ModelWavefunctionView
+from src.grad import (
+    _ModelWavefunctionView,
+    _tree_add,
+    tdvp_vmc_gradient,
+    tdvp_vmc_trajectory_gradient,
+)
 from src.hamiltonian import TransverseIsingHamiltonian
 from src.loss import tdvp_residual_loss
-from src.sampler import metropolis_hastings_sample
+from src.sampler import (
+    metropolis_hastings_sample,
+    metropolis_hastings_trajectory,
+)
 from src.wavefunction import Wavefunction, tSpinNQS
 
 
@@ -57,7 +66,11 @@ class TrainingConfig:
     t_initial: float = 0.0
     t_final: float = 1.0
     time_steps: int = 10
-    time_loss_mode: str = "sum"
+
+    # Initial Condition Anchoring (t=0)
+    pretrain_steps: int = 0
+    pretrain_lr: float = 0.005
+    lambda_ic: float = 0.0
 
     # Checkpointing
     checkpoint_dir: Optional[str] = None
@@ -75,10 +88,6 @@ def _validate_training_config(config: TrainingConfig) -> None:
         raise ValueError(f"n_steps must be > 0, got {config.n_steps}")
     if config.time_steps <= 0:
         raise ValueError(f"time_steps must be > 0, got {config.time_steps}")
-    if config.time_loss_mode not in ("sum", "serial"):
-        raise ValueError(
-            f"time_loss_mode must be 'sum' or 'serial', got {config.time_loss_mode!r}"
-        )
     if config.learning_rate <= 0:
         raise ValueError(f"learning_rate must be > 0, got {config.learning_rate}")
     if config.optimizer_name.lower() not in ("adamw", "muon"):
@@ -103,6 +112,12 @@ def _validate_training_config(config: TrainingConfig) -> None:
         raise ValueError(f"burn_in must be >= 0, got {config.burn_in}")
     if config.thinning <= 0:
         raise ValueError(f"thinning must be > 0, got {config.thinning}")
+    if config.pretrain_steps < 0:
+        raise ValueError(f"pretrain_steps must be >= 0, got {config.pretrain_steps}")
+    if config.pretrain_lr <= 0:
+        raise ValueError(f"pretrain_lr must be > 0, got {config.pretrain_lr}")
+    if config.lambda_ic < 0:
+        raise ValueError(f"lambda_ic must be >= 0, got {config.lambda_ic}")
     if config.initial_chain_configurations is not None:
         _validate_chain_configurations(
             config.initial_chain_configurations,
@@ -121,6 +136,24 @@ def _initialize_wavefunction(config: TrainingConfig, rng: jax.Array) -> tSpinNQS
         head_dim=config.head_dim,
         rngs=nnx.Rngs(int(rng[0])),
     )
+
+
+def _x_polarized_mse_loss(
+    model: nnx.Module,
+    configurations: jnp.ndarray,
+    n_sites: int,
+) -> jnp.ndarray:
+    """MSE loss against X-polarized state: logp = -N log 2, phase = 0."""
+    wf_view = _ModelWavefunctionView(model)
+    logp, phi = wf_view(configurations, t=0.0)
+
+    target_logp = -n_sites * jnp.log(2.0)
+    target_phi = 0.0
+
+    loss_logp = jnp.mean((logp - target_logp) ** 2)
+    loss_phi = jnp.mean((phi - target_phi) ** 2)
+
+    return loss_logp + loss_phi
 
 
 def _validate_chain_configurations(
@@ -322,123 +355,6 @@ def _apply_optimizer_update(
     return new_opt_state
 
 
-def _evaluate_time_slice(
-    wf: Wavefunction,
-    ham: TransverseIsingHamiltonian,
-    t: float,
-    config: TrainingConfig,
-    rng: jax.Array,
-    *,
-    initial_configurations: Optional[jnp.ndarray] = None,
-) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray], Any, jax.Array, jnp.ndarray]:
-    """Sample one time slice and compute its loss/gradient without updating parameters."""
-    rng, rng_sample = jax.random.split(rng)
-
-    if initial_configurations is None:
-        initial_configurations = jnp.zeros((config.n_chains, ham.N), dtype=jnp.int32)
-    init_config = _validate_chain_configurations(
-        initial_configurations,
-        n_chains=config.n_chains,
-        n_sites=ham.N,
-    )
-    samples, sampler_stats = metropolis_hastings_sample(
-        wf=wf,
-        initial_configurations=init_config,
-        t=jnp.asarray(t, dtype=jnp.float32),
-        n_sites=ham.N,
-        n_samples=config.n_samples_per_chain,
-        burn_in=config.burn_in,
-        thinning=config.thinning,
-        key=rng_sample,
-        return_stats=True,
-    )
-
-    batch_size = config.n_chains * config.n_samples_per_chain
-    configurations_batch = samples.reshape((batch_size, ham.N))
-
-    loss_value, loss_diag = tdvp_residual_loss(
-        ham=ham,
-        wf=wf,
-        configurations=configurations_batch,
-        t=jnp.asarray(t, dtype=jnp.float32),
-        return_diagnostics=True,
-    )
-
-    grad_total, grad_aux = tdvp_vmc_gradient(
-        ham=ham,
-        wf=wf,
-        configurations=configurations_batch,
-        t=jnp.asarray(t, dtype=jnp.float32),
-        return_diagnostics=True,
-    )
-
-    loss = jnp.asarray(loss_value, dtype=jnp.float32)
-    accept_rate_vals = jnp.asarray(sampler_stats["acceptance_rate"], dtype=jnp.float32)
-    if accept_rate_vals.ndim > 0:
-        accept_rate_mean = jnp.mean(accept_rate_vals)
-    else:
-        accept_rate_mean = accept_rate_vals
-
-    e_real_mean = jnp.mean(jnp.asarray(loss_diag.e_real, dtype=jnp.float32))
-    e_imag_mean = jnp.mean(jnp.asarray(loss_diag.e_imag, dtype=jnp.float32))
-
-    diagnostics = {
-        "loss": loss,
-        "acceptance_rate": accept_rate_mean,
-        "grad_norm_pathwise": jnp.asarray(
-            grad_aux["grad_norm_pathwise"], dtype=jnp.float32
-        ),
-        "grad_norm_covariance": jnp.asarray(
-            grad_aux["grad_norm_covariance"], dtype=jnp.float32
-        ),
-        "grad_norm_total": jnp.asarray(grad_aux["grad_norm_total"], dtype=jnp.float32),
-        "ell_mean": jnp.asarray(grad_aux["ell_mean"], dtype=jnp.float32),
-        "ell_std": jnp.asarray(grad_aux["ell_std"], dtype=jnp.float32),
-        "finite_loss": jnp.asarray(grad_aux["finite_loss"]),
-        "finite_grads": jnp.asarray(grad_aux["finite_grads"]),
-        "e_real_mean": e_real_mean,
-        "e_imag_mean": e_imag_mean,
-    }
-
-    next_configurations = samples[:, -1, :]
-    return loss, diagnostics, grad_total, rng, next_configurations
-
-
-def train_step(
-    wf: Wavefunction,
-    ham: TransverseIsingHamiltonian,
-    t: float,
-    config: TrainingConfig,
-    optimizer: optax.GradientTransformation,
-    opt_state: Any,
-    rng: jax.Array,
-    *,
-    initial_configurations: Optional[jnp.ndarray] = None,
-) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray], Any, jax.Array, jnp.ndarray]:
-    """Single training step: sample → loss → grad → update.
-
-    Returns:
-        (loss, diagnostics_dict, next_opt_state, next_rng, next_chain_configurations)
-    """
-    loss, diagnostics, grad_total, rng, next_configurations = _evaluate_time_slice(
-        wf=wf,
-        ham=ham,
-        t=t,
-        config=config,
-        rng=rng,
-        initial_configurations=initial_configurations,
-    )
-
-    # AdamW update: update parameters in-place and carry optimizer state.
-    opt_state = _apply_optimizer_update(
-        wf.model,
-        optimizer,
-        opt_state,
-        grad_total,
-    )
-    return loss, diagnostics, opt_state, rng, next_configurations
-
-
 def train_loop(
     config: TrainingConfig,
     verbose: bool = True,
@@ -491,6 +407,43 @@ def train_loop(
     else:
         opt_state = initial_opt_state
 
+    # 2) Pretraining Phase (Optional)
+    if config.pretrain_steps > 0:
+        if verbose:
+            print(
+                f"\n=== Pretraining initial condition (X-polarized) for {config.pretrain_steps} steps ==="
+            )
+
+        pretrain_optimizer = optax.adam(config.pretrain_lr)
+        pretrain_opt_state = pretrain_optimizer.init(nnx.state(wf.model, nnx.Param))
+
+        @nnx.jit
+        def pretrain_step(model, os, keys):
+            # Generate random configurations for uniform target distribution
+            configs = jax.random.randint(keys, (config.batch_size, config.N), 0, 2)
+
+            def loss_fn(m):
+                return _x_polarized_mse_loss(m, configs, config.N)
+
+            loss, grad = nnx.value_and_grad(loss_fn)(model)
+
+            # Standard optimizer update
+            params = nnx.state(model, nnx.Param)
+            updates, new_os = pretrain_optimizer.update(grad, os, params)
+            new_params = optax.apply_updates(params, updates)
+            nnx.update(model, new_params)
+            return loss, new_os
+
+        for i in range(config.pretrain_steps):
+            rng, pretrain_rng = jax.random.split(rng)
+            loss_val, pretrain_opt_state = pretrain_step(
+                wf.model, pretrain_opt_state, pretrain_rng
+            )
+            if verbose and (i + 1) % max(1, config.pretrain_steps // 5) == 0:
+                print(
+                    f"  Pretrain step {i + 1}/{config.pretrain_steps}: MSE loss = {float(loss_val):.6f}"
+                )
+
     # 3) Time schedule.
     times = jnp.linspace(config.t_initial, config.t_final, config.time_steps)
 
@@ -519,229 +472,150 @@ def train_loop(
         )
 
     # Distribute chains across CPU/TPU cores using JAX SPMD.
-    from jax.sharding import Mesh, PartitionSpec, NamedSharding
-    
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
     n_devices = jax.device_count()
     if config.n_chains % n_devices != 0:
         # Fallback to single-device mesh if chains can't be evenly distributed
         mesh_devices = [jax.devices()[0]]
     else:
         mesh_devices = jax.devices()
-        
-    mesh = Mesh(mesh_devices, axis_names=('chains',))
-    sharding = NamedSharding(mesh, PartitionSpec('chains'))
+
+    mesh = Mesh(mesh_devices, axis_names=("chains",))
+    sharding = NamedSharding(mesh, PartitionSpec("chains"))
     chain_configurations = jax.device_put(chain_configurations, sharding)
 
     time_indices = list(range(start_time_index, config.time_steps))
+    # Active time slices for this run
+    active_times = times[jnp.array(time_indices)]
 
     @nnx.jit
-    def jitted_eval_slice(model, t_val, rng_val, init_configs):
+    def jitted_trajectory_train_step(model, opt_st, configs, rng_val):
         wf_view = _ModelWavefunctionView(model)
-        return _evaluate_time_slice(
+
+        # 1) Sample spacetime trajectory (warm-started)
+        # all_samples: (T_active, C, S, N)
+        # next_configs: (C, N)
+        rng_val, rng_sample = jax.random.split(rng_val)
+        all_samples, all_stats, next_configs = metropolis_hastings_trajectory(
             wf=wf_view,
-            ham=ham,
-            t=t_val,
-            config=config,
-            rng=rng_val,
-            initial_configurations=init_configs,
+            initial_configurations=configs,
+            times=active_times,
+            n_sites=ham.N,
+            n_samples=config.n_samples_per_chain,
+            burn_in=config.burn_in,
+            thinning=config.thinning,
+            key=rng_sample,
         )
 
-    @nnx.jit
-    def jitted_opt_update(model, opt_st, grad_state):
-        return _apply_optimizer_update(
-            model=model,
-            optimizer=optimizer,
-            opt_state=opt_st,
-            grad_state=grad_state,
+        # Reshape for unified gradient computation
+        # T_active is the number of time slices being optimized jointly
+        T_active = active_times.shape[0]
+        batch_size_per_slice = config.n_chains * config.n_samples_per_chain
+        all_configs_batch = all_samples.reshape((T_active, batch_size_per_slice, ham.N))
+
+        # 2) Compute unified spacetime gradient
+        grad_total, diag = tdvp_vmc_trajectory_gradient(
+            ham=ham,
+            wf=wf_view,
+            all_configurations=all_configs_batch,
+            times=active_times,
         )
 
-    @nnx.jit
-    def jitted_train_step(model, t_val, rng_val, init_configs, opt_st):
-        wf_view = _ModelWavefunctionView(model)
-        loss_val, diag_val, grad_total, new_rng, next_configs = _evaluate_time_slice(
-            wf=wf_view,
-            ham=ham,
-            t=t_val,
-            config=config,
-            rng=rng_val,
-            initial_configurations=init_configs,
-        )
-        opt_st = _apply_optimizer_update(
+        # Add sampling diagnostics (mean across active time slices)
+        diag["acceptance_rate"] = jnp.mean(all_stats["acceptance_rate"])
+
+        # 3) Initial Condition Anchoring (Lagrangian Penalty at t=0)
+        if config.lambda_ic > 0.0:
+            rng_val, ic_rng = jax.random.split(rng_val)
+            ic_configs = jax.random.randint(ic_rng, (config.batch_size, config.N), 0, 2)
+
+            def ic_loss_fn(m):
+                return _x_polarized_mse_loss(m, ic_configs, config.N)
+
+            grad_ic = nnx.grad(ic_loss_fn)(model)
+            grad_total = _tree_add(
+                grad_total,
+                jax.tree_util.tree_map(lambda g: g * config.lambda_ic, grad_ic),
+            )
+            # Update total norm diagnostic
+            diag["grad_norm_total"] = jnp.asarray(
+                jnp.linalg.norm(
+                    jnp.concatenate(
+                        [
+                            jnp.ravel(jnp.asarray(leaf, dtype=jnp.float32))
+                            for leaf in jax.tree_util.tree_leaves(grad_total)
+                        ]
+                    )
+                )
+            )
+
+        # 4) Apply Optimizer Update
+        new_opt_state = _apply_optimizer_update(
             model=model,
             optimizer=optimizer,
             opt_state=opt_st,
             grad_state=grad_total,
         )
-        return loss_val, diag_val, opt_st, new_rng, next_configs
 
-    if config.time_loss_mode == "serial":
-        for t_idx in time_indices:
-            t = times[t_idx]
-            if verbose:
-                print(
-                    f"\n=== Time step {t_idx + 1}/{config.time_steps}, t={float(t):.4f} ==="
-                )
+        return diag, new_opt_state, next_configs, rng_val
 
-            for local_step in range(config.n_steps):
-                rng, step_rng = jax.random.split(rng)
-
-                loss, diag, opt_state, rng, chain_configurations = jitted_train_step(
-                    wf.model, float(t), step_rng, chain_configurations, opt_state
-                )
-
-                for key in metrics_history.keys():
-                    if key in ("time", "step"):
-                        continue
-                    if key in diag:
-                        metrics_history[key].append(float(diag[key]))
-
-                metrics_history["time"].append(float(t))
-                metrics_history["step"].append(global_step)
-
-                if verbose and (local_step + 1) % max(1, config.n_steps // 5) == 0:
-                    print(
-                        f"  Step {local_step + 1}/{config.n_steps}: "
-                        f"loss={float(loss):.6f}, "
-                        f"accept_rate={float(diag['acceptance_rate']):.3f}, "
-                        f"grad_norm={float(diag['grad_norm_total']):.6f}"
-                    )
-
-                global_step += 1
-
-            if config.checkpoint_dir and (t_idx + 1) % config.checkpoint_interval == 0:
-                ckpt_path = f"{config.checkpoint_dir}/checkpoint_t{t_idx + 1:03d}.pkl"
-                _save_checkpoint(
-                    config,
-                    wf,
-                    ham,
-                    metrics_history,
-                    global_step,
-                    t_idx + 1,
-                    float(t),
-                    chain_configurations,
-                    rng,
-                    opt_state,
-                    ckpt_path,
-                )
-                if verbose:
-                    print(f"  Checkpoint saved to {ckpt_path}")
-    else:
-        for local_step in range(config.n_steps):
-            if verbose:
-                print(
-                    f"\n=== Joint time step {local_step + 1}/{config.n_steps} "
-                    f"over {len(time_indices)} time slices ==="
-                )
-
-            step_chain_configurations = chain_configurations
-            loss_total = jnp.asarray(0.0, dtype=jnp.float32)
-            grad_total = None
-            acceptance_rates = []
-            grad_norm_pathwise_vals = []
-            grad_norm_covariance_vals = []
-            grad_norm_total_vals = []
-            ell_mean_vals = []
-            ell_std_vals = []
-            finite_loss_flags = []
-            finite_grads_flags = []
-            e_real_means = []
-            e_imag_means = []
-
-            for t_idx in time_indices:
-                t = times[t_idx]
-                rng, step_rng = jax.random.split(rng)
-                loss, diag, grad_slice, rng, step_chain_configurations = jitted_eval_slice(
-                    wf.model, float(t), step_rng, step_chain_configurations
-                )
-
-                loss_total = loss_total + loss
-                grad_total = grad_slice if grad_total is None else _tree_add(
-                    grad_total, grad_slice
-                )
-                acceptance_rates.append(jnp.asarray(diag["acceptance_rate"]))
-                grad_norm_pathwise_vals.append(jnp.asarray(diag["grad_norm_pathwise"]))
-                grad_norm_covariance_vals.append(
-                    jnp.asarray(diag["grad_norm_covariance"])
-                )
-                grad_norm_total_vals.append(jnp.asarray(diag["grad_norm_total"]))
-                ell_mean_vals.append(jnp.asarray(diag["ell_mean"]))
-                ell_std_vals.append(jnp.asarray(diag["ell_std"]))
-                finite_loss_flags.append(jnp.asarray(diag["finite_loss"]))
-                finite_grads_flags.append(jnp.asarray(diag["finite_grads"]))
-                e_real_means.append(jnp.asarray(diag["e_real_mean"]))
-                e_imag_means.append(jnp.asarray(diag["e_imag_mean"]))
-
-            opt_state = jitted_opt_update(
-                wf.model,
-                opt_state,
-                grad_total,
+    for local_step in range(config.n_steps):
+        if verbose:
+            print(
+                f"\n=== Spacetime Trajectory Step {local_step + 1}/{config.n_steps} "
+                f"over {len(time_indices)} time slices ==="
             )
-            chain_configurations = step_chain_configurations
 
-            diag = {
-                "loss": loss_total,
-                "acceptance_rate": jnp.mean(jnp.stack(acceptance_rates)),
-                "grad_norm_pathwise": jnp.mean(jnp.stack(grad_norm_pathwise_vals)),
-                "grad_norm_covariance": jnp.mean(
-                    jnp.stack(grad_norm_covariance_vals)
-                ),
-                "grad_norm_total": jnp.asarray(
-                    jnp.linalg.norm(
-                        jnp.concatenate(
-                            [
-                                jnp.ravel(jnp.asarray(leaf, dtype=jnp.float32))
-                                for leaf in jax.tree_util.tree_leaves(grad_total)
-                            ]
-                        )
-                    )
-                ),
-                "ell_mean": jnp.mean(jnp.stack(ell_mean_vals)),
-                "ell_std": jnp.mean(jnp.stack(ell_std_vals)),
-                "finite_loss": jnp.asarray(jnp.all(jnp.stack(finite_loss_flags))),
-                "finite_grads": jnp.asarray(jnp.all(jnp.stack(finite_grads_flags))),
-                "e_real_mean": jnp.mean(jnp.stack(e_real_means)),
-                "e_imag_mean": jnp.mean(jnp.stack(e_imag_means)),
-            }
+        diag, opt_state, chain_configurations, rng = jitted_trajectory_train_step(
+            wf.model, opt_state, chain_configurations, rng
+        )
 
-            for key in metrics_history.keys():
-                if key in ("time", "step"):
-                    continue
-                if key in diag:
-                    metrics_history[key].append(float(diag[key]))
+        # Record metrics
+        for key in metrics_history.keys():
+            if key in ("time", "step"):
+                continue
+            if key in diag:
+                metrics_history[key].append(float(diag[key]))
 
-            metrics_history["time"].append(float(jnp.mean(times[jnp.array(time_indices)])))
-            metrics_history["step"].append(global_step)
+        metrics_history["time"].append(float(jnp.mean(active_times)))
+        metrics_history["step"].append(global_step)
 
+        if verbose:
+            print(
+                f"  Trajectory step {local_step + 1}/{config.n_steps}: "
+                f"loss={float(diag['loss']):.6f}, "
+                f"accept_rate={float(diag['acceptance_rate']):.3f}, "
+                f"grad_norm={float(diag['grad_norm_total']):.6f}"
+            )
+
+        global_step += 1
+
+        if (
+            config.checkpoint_dir
+            and (local_step + 1) % config.checkpoint_interval == 0
+        ):
+            ckpt_path = (
+                f"{config.checkpoint_dir}/checkpoint_step{local_step + 1:04d}.pkl"
+            )
+            _save_checkpoint(
+                config,
+                wf,
+                ham,
+                metrics_history,
+                global_step,
+                config.time_steps,
+                float(times[-1]),
+                chain_configurations,
+                rng,
+                opt_state,
+                ckpt_path,
+            )
             if verbose:
-                print(
-                    f"  Joint step {local_step + 1}/{config.n_steps}: "
-                    f"loss={float(diag['loss']):.6f}, "
-                    f"accept_rate={float(diag['acceptance_rate']):.3f}, "
-                    f"grad_norm={float(diag['grad_norm_total']):.6f}"
-                )
-
-            global_step += 1
-
-            if config.checkpoint_dir and (local_step + 1) % config.checkpoint_interval == 0:
-                ckpt_path = f"{config.checkpoint_dir}/checkpoint_t{local_step + 1:03d}.pkl"
-                _save_checkpoint(
-                    config,
-                    wf,
-                    ham,
-                    metrics_history,
-                    global_step,
-                    config.time_steps,
-                    float(times[-1]),
-                    chain_configurations,
-                    rng,
-                    opt_state,
-                    ckpt_path,
-                )
-                if verbose:
-                    print(f"  Checkpoint saved to {ckpt_path}")
+                print(f"  Checkpoint saved to {ckpt_path}")
 
     if verbose:
-        print(f"\n=== Training complete ===")
+        print("\n=== Training complete ===")
         print(f"Total steps: {global_step}")
         if metrics_history["loss"]:
             print(f"Final loss: {metrics_history['loss'][-1]:.6f}")

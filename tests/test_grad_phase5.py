@@ -1,7 +1,11 @@
 import flax.nnx as nnx
 import jax.numpy as jnp
 
-from src.grad import tdvp_vmc_gradient, tdvp_vmc_gradient_components
+from src.grad import (
+    tdvp_vmc_gradient,
+    tdvp_vmc_gradient_components,
+    tdvp_vmc_trajectory_gradient,
+)
 from src.hamiltonian import TransverseIsingHamiltonian
 from src.loss import tdvp_residual_loss
 from src.wavefunction import tSpinNQS
@@ -222,3 +226,31 @@ def test_tdvp_vmc_gradient_input_validation_shape_length_binary():
         assert False, "Expected ValueError for non-binary configurations."
     except ValueError as e:
         assert "binary bits in {0,1}" in str(e)
+
+
+def test_tdvp_vmc_trajectory_gradient_returns_valid_output():
+    import jax
+    N = 4
+    ham = TransverseIsingHamiltonian(J=1.0, h=0.5, N=N)
+    wf = _make_wf(N=N, seed=42)
+    
+    T = 3
+    times = jnp.array([0.0, 0.1, 0.2], dtype=jnp.float32)
+    B = 4
+    # (T, B, N)
+    all_configs = jax.random.randint(jax.random.PRNGKey(0), (T, B, N), 0, 2)
+    
+    grad_total, diag = tdvp_vmc_trajectory_gradient(
+        ham=ham,
+        wf=wf,
+        all_configurations=all_configs,
+        times=times,
+    )
+    
+    _assert_tree_all_finite(grad_total)
+    assert float(_tree_l2_norm(grad_total)) > 0.0
+    
+    required = {"loss", "grad_norm_total", "e_real_mean", "e_imag_mean", "ell_mean"}
+    assert required.issubset(set(diag.keys()))
+    assert jnp.isfinite(diag["loss"])
+    assert jnp.isfinite(diag["grad_norm_total"])

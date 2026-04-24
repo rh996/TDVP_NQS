@@ -55,21 +55,6 @@ def test_call_output_shapes_for_single_and_batch_inputs():
     assert batch_phi.shape == (batch_config.shape[0],)
 
 
-def test_log_prob_and_phase_match_call_outputs():
-    N = 4
-    wf = _make_model(N=N)
-
-    configs = jnp.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=jnp.int32)
-    t = jnp.float32(0.6)
-
-    call_logp, call_phi = wf(configs, t)
-    lp = wf.log_prob(configs, t)
-    ph = wf.phase(configs, t)
-
-    assert jnp.allclose(lp, call_logp, atol=1e-6)
-    assert jnp.allclose(ph, call_phi, atol=1e-6)
-
-
 def test_outputs_are_finite_for_valid_inputs():
     N = 7
     wf = _make_model(N=N)

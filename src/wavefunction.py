@@ -7,16 +7,11 @@ import jax.numpy as jnp
 class Wavefunction(ABC):
     """Abstract base class for variational wavefunctions."""
 
+    def __init__(self):
+        self.model: nn.Module = None
+
     @abstractmethod
     def __call__(self, configuration, t):
-        return None
-
-    @abstractmethod
-    def log_prob(self, configuration, t):
-        return None
-
-    @abstractmethod
-    def phase(self, configuration, t):
         return None
 
     def local_tdvp_estimator(self, configuration):
@@ -30,6 +25,9 @@ class Encoder(nn.Module):
         self.vocab = 2
         self.token_embeds = nn.Embed(self.vocab, embed_dim, rngs=rngs)
         self.pos_embeds = nn.Embed(seq_dim, embed_dim, rngs=rngs)
+        # Time MLP: (1, D) -> GeLU -> (D, D) -> GeLU
+        self.time_mlp1 = nn.Linear(1, embed_dim, rngs=rngs)
+        self.time_mlp2 = nn.Linear(embed_dim, embed_dim, rngs=rngs)
         self.seq_dim = seq_dim
 
     def __call__(self, configuration: jnp.ndarray, t):
@@ -45,15 +43,21 @@ class Encoder(nn.Module):
 
         batch_dim = configuration.shape[0]
 
+        # Time feature vector: (B, 1) -> (B, D)
+        t_val = jnp.full((batch_dim, 1), t)
+        t_feat = nn.gelu(self.time_mlp1(t_val))
+        t_feat = nn.gelu(self.time_mlp2(t_feat))
+        
+        # Reshape for broadcasting: (B, 1, D)
+        t_feat = t_feat[:, jnp.newaxis, :]
+
         positions = jnp.arange(self.seq_dim)[jnp.newaxis, :].repeat(
             configuration.shape[0], axis=0
         )
 
         x = self.token_embeds(configuration) + self.pos_embeds(positions)
-
-        # append the time to embedding vector
-        t = jnp.full((batch_dim, self.seq_dim, 1), t)
-        x = jnp.concatenate([x, t], axis=2)
+        # Additive time feature
+        x = x + t_feat
 
         return x
 
@@ -158,7 +162,6 @@ class tNQS(nn.Module):
         self.head_dim = head_dim
 
         self.encoder = Encoder(self.N, emb_dim, rngs=rngs)
-        self.emb_dim += 1
 
         self.layers = nn.data([])
 

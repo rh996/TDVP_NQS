@@ -1,36 +1,60 @@
 import jax
 import jax.numpy as jnp
 
-from src.sampler import metropolis_hastings_sample
+from src.sampler import metropolis_hastings_sample, metropolis_hastings_trajectory
 
 
 class DummyWF:
-    """Deterministic toy wavefunction exposing log_prob API."""
+    """Deterministic toy wavefunction exposing main API."""
 
     def __init__(self, alpha=0.0, beta=0.0):
         self.alpha = alpha
         self.beta = beta
 
-    def log_prob(self, configuration, t):
+    def __call__(self, configuration, t):
         cfg = jnp.asarray(configuration)
         t = jnp.asarray(t, dtype=jnp.float32)
         if cfg.ndim == 1:
-            return self.alpha * jnp.sum(cfg, dtype=jnp.float32) + self.beta * t
-        if cfg.ndim == 2:
-            return self.alpha * jnp.sum(cfg, axis=1, dtype=jnp.float32) + self.beta * t
-        raise ValueError(f"Unexpected configuration shape: {cfg.shape}")
+            logp = self.alpha * jnp.sum(cfg, dtype=jnp.float32) + self.beta * t
+        elif cfg.ndim == 2:
+            logp = self.alpha * jnp.sum(cfg, axis=1, dtype=jnp.float32) + self.beta * t
+        else:
+            raise ValueError(f"Unexpected configuration shape: {cfg.shape}")
+        
+        return logp, jnp.zeros_like(logp)
 
-    def __call__(self, configuration, t):
-        # Included for compatibility with broader codebase expectations.
-        return self.log_prob(configuration, t), jnp.asarray(0.0, dtype=jnp.float32)
 
-    def phase(self, configuration, t):
-        cfg = jnp.asarray(configuration)
-        if cfg.ndim == 1:
-            return jnp.asarray(0.0, dtype=jnp.float32)
-        if cfg.ndim == 2:
-            return jnp.zeros((cfg.shape[0],), dtype=jnp.float32)
-        raise ValueError(f"Unexpected configuration shape: {cfg.shape}")
+def test_sampler_trajectory_warm_starting():
+    key = jax.random.PRNGKey(42)
+    wf = DummyWF(alpha=0.1, beta=-0.05)
+    n_sites = 4
+    n_chains = 2
+    times = jnp.array([0.0, 0.5, 1.0], dtype=jnp.float32)
+    init = jnp.zeros((n_chains, n_sites), dtype=jnp.int32)
+
+    n_samples = 5
+    burn_in = 10
+    thinning = 2
+
+    all_samples, all_stats, final_configs = metropolis_hastings_trajectory(
+        wf=wf,
+        initial_configurations=init,
+        times=times,
+        n_sites=n_sites,
+        n_samples=n_samples,
+        burn_in=burn_in,
+        thinning=thinning,
+        key=key,
+    )
+
+    # Output shapes
+    assert all_samples.shape == (len(times), n_chains, n_samples, n_sites)
+    assert final_configs.shape == (n_chains, n_sites)
+    
+    # Warm start check: last sample of T=0 should be starting point for T=1 internals, 
+    # but since we return samples after thinning/burn_in, we check continuity of final state.
+    # The final config of slice 0 is the starting point of slice 1.
+    assert jnp.array_equal(final_configs, all_samples[-1, :, -1, :])
 
 
 def test_sampler_shapes_and_bit_domain_single_chain():

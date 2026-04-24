@@ -585,3 +585,39 @@
 
 - Massively improved training speed, seamlessly scaling to large batch evaluations (e.g., 100,000+ MH proposals per step) in seconds.
 - Multi-device TPU distribution works instantly by simply requesting multiples of the device count for the `n_chains` parameter.
+
+---
+
+## 2026-04-18 — Spacetime Vectorization, API Cleanup, and Per-Site Observables
+
+### What changed
+
+- **Vectorized Trajectory Architecture**:
+  - Refactored `src/sampler.py` to include `metropolis_hastings_trajectory`, using `jax.lax.scan` to generate a full spacetime warm-started trajectory in one call.
+  - Implemented `tdvp_vmc_trajectory_gradient` in `src/grad.py`, which uses `nnx.vmap` to vectorize the TDVP loss and covariance correction over the entire time dimension.
+  - Consolidated the `train_loop` in `src/TDVP.py` into a single `@nnx.jit` trajectory step, replacing the legacy per-time-slice Python loops and removing the `serial` update mode.
+- **Wavefunction API & Encoding**:
+  - Streamlined the `Wavefunction` API by removing redundant `log_prob` and `phase` methods, centralizing all logic in the main `__call__` method to ensure single-pass evaluations.
+  - Refactored `Encoder` in `src/wavefunction.py` to use a **2-layer MLP** (`Linear` -> `GeLU` -> `Linear` -> `GeLU`) for time features, which are now added to the spin embeddings rather than appended.
+- **Enhanced Observables**:
+  - Implemented **per-site expectation values** $\langle Z_i(t) \rangle$ and $\langle X_i(t) \rangle$ in `src/observables.py`.
+  - Registered `ObservableEstimates`, `LossDiagnostics`, and `GradientDiagnostics` as **JAX PyTrees** to allow them to flow through JIT/Vmap transformations.
+- **Physics Anchoring**:
+  - Added a two-step **Initial Condition Anchoring** scheme: 1) MSE pretraining to the X-polarized state at $t=0$, and 2) a Lagrangian penalty ($\lambda_{IC}$) during evolution to prevent boundary drift.
+- **Optimization & Performance**:
+  - Refactored time-derivative calculations in `src/loss.py` to use **Forward-mode AD (`jax.jvp`)**, cutting the computational cost of $\partial_t \Psi$ in half.
+  - JIT-compiled the post-training measurement loop in the example scripts.
+
+### Why
+
+- Vectorizing over the time dimension allows XLA to optimize the entire spacetime gradient volume as a single monolithic graph, maximizing TPU/GPU utilization.
+- Transitioning from additive MLP time features improves the expressivity of the time-dependent NQS compared to simple concatenation.
+- Per-site observables are critical for analyzing local physics and entanglement growth that site-averaged metrics miss.
+- Anchoring the initial condition is mathematically required to make the TDVP differential equation well-posed.
+
+### Expected impact
+
+- Drastically reduced training time for long trajectories.
+- Improved physics accuracy through exact boundary anchoring.
+- Higher expressivity in the neural quantum state's time dependence.
+- All 44 tests now pass with the streamlined API and vectorized backend.

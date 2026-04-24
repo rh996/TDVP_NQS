@@ -25,18 +25,26 @@ class DummyWavefunction:
             return jnp.sum(cfg, axis=1, dtype=jnp.float32)
         raise ValueError(f"Unexpected configuration shape: {cfg.shape}")
 
-    def log_prob(self, configuration, t):
-        return self.alpha * self._sum_bits(configuration) + self.beta * jnp.asarray(
-            t, dtype=jnp.float32
-        )
-
-    def phase(self, configuration, t):
-        return self.gamma * self._sum_bits(configuration) + self.delta * jnp.asarray(
-            t, dtype=jnp.float32
-        )
-
     def __call__(self, configuration, t):
-        return self.log_prob(configuration, t), self.phase(configuration, t)
+        logp = self.alpha * self._sum_bits(configuration) + self.beta * jnp.asarray(
+            t, dtype=jnp.float32
+        )
+        phi = self.gamma * self._sum_bits(configuration) + self.delta * jnp.asarray(
+            t, dtype=jnp.float32
+        )
+        return logp, phi
+
+
+def test_measure_observables_handles_per_site_values():
+    wf = DummyWavefunction(alpha=0.0, gamma=0.0)
+    configs = jnp.array([[0, 1, 0, 1]], dtype=jnp.int32)
+    
+    obs = measure_observables(wf, configs, t=0.0, n_sites=4)
+    
+    # Z per site: 1 - 2*bits -> [1, -1, 1, -1]
+    assert jnp.allclose(obs.z_sites, jnp.array([1.0, -1.0, 1.0, -1.0]))
+    assert obs.x_sites_real.shape == (4,)
+    assert obs.x_sites_imag.shape == (4,)
 
 
 def test_measure_observables_matches_manual_formula_on_samples():

@@ -11,6 +11,7 @@ from src.wavefunction import Wavefunction
 PyTree = Any
 
 
+@jax.tree_util.register_pytree_node_class
 @dataclass
 class GradientDiagnostics:
     """Diagnostics for Phase-5 TDVP/VMC gradient estimation."""
@@ -26,6 +27,26 @@ class GradientDiagnostics:
     finite_loss: jnp.ndarray
     finite_grads: jnp.ndarray
 
+    def tree_flatten(self):
+        children = (
+            self.loss,
+            self.ell,
+            self.ell_mean,
+            self.ell_std,
+            self.grad_norm_pathwise,
+            self.grad_norm_covariance,
+            self.grad_norm_total,
+            self.ell_var,
+            self.finite_loss,
+            self.finite_grads,
+        )
+        aux_data = None
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
 
 class _ModelWavefunctionView(Wavefunction):
     """Wavefunction adapter that evaluates through a provided NNX model."""
@@ -36,14 +57,6 @@ class _ModelWavefunctionView(Wavefunction):
     def __call__(self, configuration, t):
         logp, phi = self.model(configuration, t)
         return self._squeeze_last_dim(logp), self._squeeze_last_dim(phi)
-
-    def log_prob(self, configuration, t):
-        logp, _ = self(configuration, t)
-        return logp
-
-    def phase(self, configuration, t):
-        _, phi = self(configuration, t)
-        return phi
 
     @staticmethod
     def _squeeze_last_dim(x: jnp.ndarray) -> jnp.ndarray:
@@ -140,7 +153,8 @@ def _per_sample_score_grads(
 
     def logp_fn(m, cfg_i):
         model_wf = _ModelWavefunctionView(m)
-        return _as_scalar_like(model_wf.log_prob(cfg_i, t), "log_prob")
+        logp, _ = model_wf(cfg_i, t)
+        return _as_scalar_like(logp, "log_prob")
 
     grad_fn = nnx.grad(logp_fn)
     vmap_grad_fn = nnx.vmap(grad_fn, in_axes=(None, 0))
@@ -251,6 +265,102 @@ def tdvp_vmc_gradient(
         "finite_grads": diagnostics.finite_grads,
     }
     return grad_total, aux
+
+
+def tdvp_vmc_trajectory_gradient(
+    ham: TransverseIsingHamiltonian,
+    wf: Wavefunction,
+    all_configurations: jnp.ndarray,
+    times: jnp.ndarray,
+) -> Tuple[PyTree, Dict[str, Any]]:
+    """Compute unified TDVP gradient summed over multiple time slices.
+
+    This function vectorizes the gradient calculation over the time dimension,
+    allowing XLA to optimize the entire spacetime gradient flow.
+
+    Args:
+        ham: Hamiltonian.
+        wf: Wavefunction adapter.
+        all_configurations: shape (T, Batch, N).
+        times: shape (T,).
+
+    Returns:
+        grad_total: Unified gradient PyTree.
+        diagnostics: Aggregated diagnostics dictionary.
+    """
+    import flax.nnx as nnx
+
+    # 1) Unified Pathwise Gradient
+    def joint_loss_fn(m):
+        model_wf = _ModelWavefunctionView(m)
+
+        def single_slice_loss(t_val, configs):
+            return _batch_loss_fn(ham, model_wf, configs, t_val)
+
+        # vmap over the time dimension (T)
+        losses = jax.vmap(single_slice_loss)(times, all_configurations)
+        return jnp.sum(losses)
+
+    grad_pathwise = nnx.grad(joint_loss_fn)(wf.model)
+
+    # 2) Vectorized Covariance Correction
+    # We must compute the covariance correction per time slice and sum them.
+    # We use nnx.vmap to handle the model state correctly across trace levels.
+    def single_slice_cov_and_diag(m, t_val, configs):
+        model_wf = _ModelWavefunctionView(m)
+        # Local residual stats
+        _, loss_diag = tdvp_residual_loss(
+            ham, model_wf, configs, t_val, return_diagnostics=True
+        )
+        ell = jnp.asarray(loss_diag.ell)
+        ell_centered = ell - jnp.mean(ell)
+
+        # Score gradients
+        score_grads_batched = _per_sample_score_grads(model_wf, configs, t_val)
+        score_mean = jax.tree_util.tree_map(
+            lambda x: jnp.mean(x, axis=0), score_grads_batched
+        )
+        score_centered = jax.tree_util.tree_map(
+            lambda g, gm: g - gm, score_grads_batched, score_mean
+        )
+
+        # Covariance for this slice
+        grad_cov_slice = jax.tree_util.tree_map(
+            lambda sc: jnp.mean(
+                sc
+                * ell_centered.reshape(
+                    (ell_centered.shape[0],) + (1,) * (sc.ndim - 1)
+                ),
+                axis=0,
+            ),
+            score_centered,
+        )
+        return grad_cov_slice, loss_diag
+
+    # Vectorize over (T) dimension using nnx.vmap
+    # we use in_axes=(None, 0, 0) to broadcast the model across all time slices
+    grad_cov_all_slices, all_diags = nnx.vmap(
+        single_slice_cov_and_diag, in_axes=(None, 0, 0)
+    )(wf.model, times, all_configurations)
+
+    # Sum covariance contributions across all time slices
+    grad_cov_total = jax.tree_util.tree_map(
+        lambda x: jnp.sum(x, axis=0), grad_cov_all_slices
+    )
+
+    # 3) Combine
+    grad_total = _tree_add(grad_pathwise, grad_cov_total)
+
+    # Aggregated diagnostics (means over time slices)
+    diag_summary = {
+        "loss": jnp.sum(all_diags.ell),  # total joint loss
+        "grad_norm_total": _tree_l2_norm(grad_total),
+        "e_real_mean": jnp.mean(all_diags.e_real),
+        "e_imag_mean": jnp.mean(all_diags.e_imag),
+        "ell_mean": jnp.mean(all_diags.ell),
+    }
+
+    return grad_total, diag_summary
 
 
 def tdvp_vmc_gradient_components(

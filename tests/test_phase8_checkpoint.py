@@ -61,10 +61,8 @@ def test_save_and_load_checkpoint_preserves_wavefunction_outputs(tmp_path: Path)
     )
     t = jnp.float32(0.25)
 
-    logp_before = result["wavefunction"].log_prob(configs, t)
-    phi_before = result["wavefunction"].phase(configs, t)
-    logp_after = loaded["wavefunction"].log_prob(configs, t)
-    phi_after = loaded["wavefunction"].phase(configs, t)
+    logp_before, phi_before = result["wavefunction"](configs, t)
+    logp_after, phi_after = loaded["wavefunction"](configs, t)
 
     assert jnp.allclose(logp_before, logp_after, atol=1e-6)
     assert jnp.allclose(phi_before, phi_after, atol=1e-6)
@@ -121,14 +119,13 @@ def test_loaded_checkpoint_can_resume_training(tmp_path: Path):
 
 def test_train_loop_writes_real_checkpoint_files(tmp_path: Path):
     config = _make_config()
-    config.time_steps = 2
     config.checkpoint_dir = str(tmp_path)
     config.checkpoint_interval = 1
 
     _ = train_loop(config, verbose=False)
 
-    ckpt1 = tmp_path / "checkpoint_t001.pkl"
-    ckpt2 = tmp_path / "checkpoint_t002.pkl"
+    ckpt1 = tmp_path / "checkpoint_step0001.pkl"
+    ckpt2 = tmp_path / "checkpoint_step0002.pkl"
     assert ckpt1.exists()
     assert ckpt2.exists()
 
