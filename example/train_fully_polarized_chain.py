@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 from src.grad import _ModelWavefunctionView
 from src.observables import sample_and_measure_observables
-from src.TDVP import TrainingConfig, train_loop
+from src.TDVP import TrainingConfig, train_loop, save_training_checkpoint
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -34,12 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adamw-b1", type=float, default=0.9)
     parser.add_argument("--adamw-b2", type=float, default=0.999)
     parser.add_argument("--adamw-eps", type=float, default=1e-8)
-    parser.add_argument("--n-samples-per-chain", type=int, default=1000)
+    parser.add_argument("--n-samples-per-chain", type=int, default=1280)
     parser.add_argument("--thinning", type=int, default=10)
     parser.add_argument("--t-initial", type=float, default=0.0)
-    parser.add_argument("--t-final", type=float, default=0.0)
-    parser.add_argument("--time-steps", type=int, default=1)
-    parser.add_argument("--pretrain-steps", type=int, default=100)
+    parser.add_argument("--t-final", type=float, default=1.0)
+    parser.add_argument("--time-steps", type=int, default=10)
+    parser.add_argument("--pretrain-steps", type=int, default=200)
     parser.add_argument("--pretrain-lr", type=float, default=0.005)
     parser.add_argument("--lambda-ic", type=float, default=10.0)
     parser.add_argument(
@@ -67,7 +67,7 @@ def main() -> None:
         J=-1.0,
         h=0.5,
         Num_boxes=2,
-        emb_dim=32,
+        emb_dim=16,
         num_heads=2,
         head_dim=8,
         optimizer_name=args.optimizer_name,
@@ -183,6 +183,23 @@ def main() -> None:
     plt.savefig(x_figure_path, dpi=150)
     plt.close()
     print(f"Saved X(t) plot to {x_figure_path}")
+
+    # --- Save Final Wavefunction ---
+    checkpoint_path = output_dir / "final_wavefunction.pkl"
+    save_training_checkpoint(
+        str(checkpoint_path),
+        wf=result["wavefunction"],
+        ham=result["hamiltonian"],
+        config=result["config"],
+        metrics_history=result["metrics_history"],
+        global_step=result["global_step"],
+        completed_time_steps=result["completed_time_steps"],
+        current_time=float(config.t_final),
+        chain_configurations=result["final_configurations"],
+        rng=result["rng"],
+        opt_state=result["opt_state"],
+    )
+    print(f"Saved final wavefunction and state to {checkpoint_path}")
 
 
 if __name__ == "__main__":

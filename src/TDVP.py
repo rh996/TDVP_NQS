@@ -142,12 +142,12 @@ def _x_polarized_mse_loss(
     model: nnx.Module,
     configurations: jnp.ndarray,
     n_sites: int,
+    target_logp: float,
 ) -> jnp.ndarray:
-    """MSE loss against X-polarized state: logp = -N log 2, phase = 0."""
+    """MSE loss against X-polarized state: logp = target, phase = 0."""
     wf_view = _ModelWavefunctionView(model)
     logp, phi = wf_view(configurations, t=0.0)
 
-    target_logp = -n_sites * jnp.log(2.0)
     target_phi = 0.0
 
     loss_logp = jnp.mean((logp - target_logp) ** 2)
@@ -407,6 +407,21 @@ def train_loop(
     else:
         opt_state = initial_opt_state
 
+    # --- Target logp for IC anchoring (Stability improvement) ---
+    ic_target_logp = 0.0
+    if config.pretrain_steps > 0 or config.lambda_ic > 0.0:
+        # Forward once with random bits to get a baseline mean logp for the initial model.
+        rng, ic_target_rng = jax.random.split(rng)
+        baseline_configs = jax.random.randint(
+            ic_target_rng, (config.batch_size, config.N), 0, 2
+        )
+        initial_logp, _ = wf(baseline_configs, 0.0)
+        ic_target_logp = float(jnp.mean(initial_logp))
+        if verbose:
+            print(
+                f"Initial condition anchoring baseline logp set to: {ic_target_logp:.6f}"
+            )
+
     # 2) Pretraining Phase (Optional)
     if config.pretrain_steps > 0:
         if verbose:
@@ -423,7 +438,7 @@ def train_loop(
             configs = jax.random.randint(keys, (config.batch_size, config.N), 0, 2)
 
             def loss_fn(m):
-                return _x_polarized_mse_loss(m, configs, config.N)
+                return _x_polarized_mse_loss(m, configs, config.N, ic_target_logp)
 
             loss, grad = nnx.value_and_grad(loss_fn)(model)
 
@@ -531,7 +546,7 @@ def train_loop(
             ic_configs = jax.random.randint(ic_rng, (config.batch_size, config.N), 0, 2)
 
             def ic_loss_fn(m):
-                return _x_polarized_mse_loss(m, ic_configs, config.N)
+                return _x_polarized_mse_loss(m, ic_configs, config.N, ic_target_logp)
 
             grad_ic = nnx.grad(ic_loss_fn)(model)
             grad_total = _tree_add(
