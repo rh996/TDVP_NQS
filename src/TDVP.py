@@ -549,10 +549,11 @@ def train_loop(
                 return _x_polarized_mse_loss(m, ic_configs, config.N, ic_target_logp)
 
             grad_ic = nnx.grad(ic_loss_fn)(model)
-            grad_total = _tree_add(
-                grad_total,
-                jax.tree_util.tree_map(lambda g: g * config.lambda_ic, grad_ic),
+            # Use tree_map for robust addition/scaling across dict/State types
+            grad_total = jax.tree_util.tree_map(
+                lambda gt, gi: gt + gi * config.lambda_ic, grad_total, grad_ic
             )
+
             # Update total norm diagnostic
             diag["grad_norm_total"] = jnp.asarray(
                 jnp.linalg.norm(
