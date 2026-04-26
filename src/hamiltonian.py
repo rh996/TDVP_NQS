@@ -1,3 +1,4 @@
+import functools
 from dataclasses import dataclass
 
 import jax
@@ -32,6 +33,24 @@ class TransverseIsingHamiltonian:
         return self.N
 
 
+@dataclass
+class LongRangeTransverseIsingHamiltonian:
+    """Long-Range Transverse-field Ising Hamiltonian.
+    
+    Convention:
+      H = J * sum_{i < j} (sigma_i^z sigma_j^z) / |i-j|^alpha + h * sum_{i} sigma_i^x
+    """
+    
+    J: float
+    h: float
+    N: int
+    alpha: float
+
+    @property
+    def n_sites(self) -> int:
+        return self.N
+
+
 def _bit_to_sz(configuration: jnp.ndarray) -> jnp.ndarray:
     """Map binary configuration {0,1} to sigma^z eigenvalues {+1,-1}."""
     configuration = configuration.astype(jnp.int32)
@@ -54,6 +73,26 @@ def zz_energy_open(
     s = _bit_to_sz(configuration).astype(jnp.float32)
     # OBC bonds: (0,1), (1,2), ..., (N-2, N-1)
     return ham.J * jnp.sum(s[:-1] * s[1:])
+
+
+def zz_energy_lrtfim(
+    ham: LongRangeTransverseIsingHamiltonian, configuration: jnp.ndarray
+) -> jnp.ndarray:
+    """Compute diagonal long-range JZZ energy."""
+    configuration = jnp.asarray(configuration).astype(jnp.int32)
+    if configuration.ndim != 1:
+        raise ValueError(f"Expected 1D configuration, got shape {configuration.shape}")
+    if configuration.shape[0] != ham.N:
+        raise ValueError(f"Expected length {ham.N}, got {configuration.shape[0]}")
+
+    if ham.N <= 1:
+        return jnp.asarray(0.0, dtype=jnp.float32)
+
+    s = _bit_to_sz(configuration).astype(jnp.float32)
+    i, j = jnp.triu_indices(ham.N, k=1)
+    dist = jnp.abs(i - j).astype(jnp.float32)
+    interaction = ham.J / (dist ** ham.alpha)
+    return jnp.sum(s[i] * s[j] * interaction)
 
 
 def _transverse_term_single_site_parts(
@@ -85,22 +124,23 @@ def _transverse_term_single_site_parts(
     return real_part, imag_part
 
 
+@functools.singledispatch
 def local_energy(
+    ham,
+    wf: Wavefunction,
+    configuration: jnp.ndarray,
+    t,
+):
+    """Return local energy as (real_part, imag_part), without complex arithmetic."""
+    raise NotImplementedError(f"local_energy not implemented for type {type(ham)}")
+
+@local_energy.register
+def _(
     ham: TransverseIsingHamiltonian,
     wf: Wavefunction,
     configuration: jnp.ndarray,
     t,
 ):
-    """Return local energy as (real_part, imag_part), without complex arithmetic.
-
-    E_loc(sigma, t) =
-        J * sum_{i=0}^{N-2} s_i s_{i+1}
-        + h * sum_{i=0}^{N-1} Psi(sigma^(i), t) / Psi(sigma, t)
-
-    with:
-      s_i = 1 - 2*bit_i, bit_i in {0,1}
-      sigma^(i): configuration with bit i flipped
-    """
     configuration = jnp.asarray(configuration).astype(jnp.int32)
     if configuration.ndim != 1:
         raise ValueError(f"Expected 1D configuration, got shape {configuration.shape}")
@@ -125,9 +165,40 @@ def local_energy(
     e_imag = jnp.sum(imag_terms)
     return e_real, e_imag
 
+@local_energy.register
+def _(
+    ham: LongRangeTransverseIsingHamiltonian,
+    wf: Wavefunction,
+    configuration: jnp.ndarray,
+    t,
+):
+    configuration = jnp.asarray(configuration).astype(jnp.int32)
+    if configuration.ndim != 1:
+        raise ValueError(f"Expected 1D configuration, got shape {configuration.shape}")
+    if configuration.shape[0] != ham.N:
+        raise ValueError(f"Expected length {ham.N}, got {configuration.shape[0]}")
+
+    zz_real = zz_energy_lrtfim(ham, configuration)
+
+    logp, phi = wf(configuration, t)
+    logp = jnp.asarray(logp).squeeze()
+    phi = jnp.asarray(phi).squeeze()
+
+    sites = jnp.arange(ham.N)
+
+    real_terms, imag_terms = jax.vmap(
+        lambda i: _transverse_term_single_site_parts(
+            i, logp, phi, wf, configuration, t, ham.h
+        )
+    )(sites)
+
+    e_real = zz_real + jnp.sum(real_terms)
+    e_imag = jnp.sum(imag_terms)
+    return e_real, e_imag
+
 
 def local_energy_batch(
-    ham: TransverseIsingHamiltonian,
+    ham,
     wf: Wavefunction,
     configurations: jnp.ndarray,
     t,
