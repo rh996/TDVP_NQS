@@ -241,12 +241,24 @@ def autoregressive_trajectory_sample(
     n_sites: int,
     batch_size: int,
     key: jax.Array,
+    n_chains: int = 1,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray], jnp.ndarray]:
     """Sample an autoregressive trajectory exactly directly without MCMC.
     
     This replaces metropolis_hastings_trajectory for Autoregressive models.
     """
     import flax.nnx as nnx
+
+    if n_chains <= 0:
+        raise ValueError(f"n_chains must be > 0, got {n_chains}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+    if batch_size % n_chains != 0:
+        raise ValueError(
+            f"batch_size must be divisible by n_chains, got {batch_size} and {n_chains}"
+        )
+
+    n_samples_per_chain = batch_size // n_chains
     
     # We must operate directly on the amp_model inside a jitted function
     # but since this function might be called inside a JIT, we should
@@ -292,11 +304,14 @@ def autoregressive_trajectory_sample(
         # Generate raw samples shape: (B, N)
         samples = generate_batch(state, t, subk)
         
-        # To match MCMC shapes (C, S, N) where C=1, S=batch_size
-        samples = samples.reshape((1, batch_size, n_sites))
+        # Match the MCMC shape contract while preserving dense AR generation.
+        samples = samples.reshape((n_chains, n_samples_per_chain, n_sites))
         
-        # Dummy stats
-        stats = {"acceptance_rate": jnp.asarray(1.0, dtype=jnp.float32)}
+        stats = {
+            "acceptance_rate": jnp.ones((n_chains,), dtype=jnp.float32),
+            "n_chains": jnp.asarray(n_chains, dtype=jnp.int32),
+            "n_samples_per_chain": jnp.asarray(n_samples_per_chain, dtype=jnp.int32),
+        }
         return prng, (samples, stats)
 
     _, (all_samples, all_stats) = jax.lax.scan(time_scan_fn, key, times)

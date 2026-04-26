@@ -529,6 +529,7 @@ def train_loop(
                 n_sites=ham.N,
                 batch_size=config.n_chains * config.n_samples_per_chain,
                 key=rng_sample,
+                n_chains=config.n_chains,
             )
         else:
             all_samples, all_stats, next_configs = metropolis_hastings_trajectory(

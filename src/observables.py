@@ -173,6 +173,7 @@ def sample_and_measure_observables(
             n_sites=n_sites,
             batch_size=batch_size,
             key=key,
+            n_chains=n_chains,
         )
         samples = all_samples[0] # (C, S, N)
     else:

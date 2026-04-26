@@ -1,7 +1,13 @@
 import jax
 import jax.numpy as jnp
+import flax.nnx as nnx
 
-from src.sampler import metropolis_hastings_sample, metropolis_hastings_trajectory
+from src.sampler import (
+    autoregressive_trajectory_sample,
+    metropolis_hastings_sample,
+    metropolis_hastings_trajectory,
+)
+from src.wavefunction import AutoregressiveNQS
 
 
 class DummyWF:
@@ -55,6 +61,37 @@ def test_sampler_trajectory_warm_starting():
     # but since we return samples after thinning/burn_in, we check continuity of final state.
     # The final config of slice 0 is the starting point of slice 1.
     assert jnp.array_equal(final_configs, all_samples[-1, :, -1, :])
+
+
+def test_autoregressive_trajectory_preserves_chain_shape():
+    key = jax.random.PRNGKey(0)
+    n_sites = 4
+    n_chains = 3
+    n_samples = 5
+    wf = AutoregressiveNQS(
+        N=n_sites,
+        Num_boxes=1,
+        emb_dim=8,
+        num_heads=2,
+        head_dim=4,
+        rngs=nnx.Rngs(0),
+    )
+
+    all_samples, all_stats, final_configs = autoregressive_trajectory_sample(
+        wf=wf,
+        times=jnp.array([0.0, 0.25], dtype=jnp.float32),
+        n_sites=n_sites,
+        batch_size=n_chains * n_samples,
+        key=key,
+        n_chains=n_chains,
+    )
+
+    assert all_samples.shape == (2, n_chains, n_samples, n_sites)
+    assert final_configs.shape == (n_chains, n_sites)
+    assert jnp.all((all_samples == 0) | (all_samples == 1))
+    assert all_stats["acceptance_rate"].shape == (2, n_chains)
+    assert int(all_stats["n_chains"][0]) == n_chains
+    assert int(all_stats["n_samples_per_chain"][0]) == n_samples
 
 
 def test_sampler_shapes_and_bit_domain_single_chain():
