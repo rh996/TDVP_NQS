@@ -161,20 +161,36 @@ def sample_and_measure_observables(
     return_samples: bool = False,
 ):
     """Sample from the wavefunction and estimate <Z> and <X>."""
-    samples, sampler_stats = metropolis_hastings_sample(
-        wf=wf,
-        initial_configurations=initial_configurations,
-        t=t,
-        n_sites=n_sites,
-        n_samples=n_samples,
-        burn_in=burn_in,
-        thinning=thinning,
-        key=key,
-        return_stats=True,
-    )
+    if hasattr(wf, 'model') and hasattr(wf.model, 'amp_model'):
+        from src.sampler import autoregressive_trajectory_sample
+        # batch_size is n_chains * n_samples_per_chain in MCMC, but the signature here only gives n_samples
+        # and initial_configurations.shape[0] is n_chains
+        n_chains = initial_configurations.shape[0]
+        batch_size = n_chains * n_samples
+        all_samples, sampler_stats, final_configurations = autoregressive_trajectory_sample(
+            wf=wf,
+            times=jnp.array([t], dtype=jnp.float32),
+            n_sites=n_sites,
+            batch_size=batch_size,
+            key=key,
+        )
+        samples = all_samples[0] # (C, S, N)
+    else:
+        samples, sampler_stats = metropolis_hastings_sample(
+            wf=wf,
+            initial_configurations=initial_configurations,
+            t=t,
+            n_sites=n_sites,
+            n_samples=n_samples,
+            burn_in=burn_in,
+            thinning=thinning,
+            key=key,
+            return_stats=True,
+        )
+        final_configurations = samples[:, -1, :]
+
     flat_samples = samples.reshape((-1, n_sites))
     estimates = measure_observables(wf, flat_samples, t, n_sites=n_sites)
-    final_configurations = samples[:, -1, :]
 
     if return_samples:
         return estimates, sampler_stats, final_configurations, samples

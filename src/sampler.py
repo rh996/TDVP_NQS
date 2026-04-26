@@ -233,3 +233,75 @@ def metropolis_hastings_trajectory(
     )
 
     return all_samples, all_stats, final_configs
+
+
+def autoregressive_trajectory_sample(
+    wf: Wavefunction,
+    times: jnp.ndarray,
+    n_sites: int,
+    batch_size: int,
+    key: jax.Array,
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray], jnp.ndarray]:
+    """Sample an autoregressive trajectory exactly directly without MCMC.
+    
+    This replaces metropolis_hastings_trajectory for Autoregressive models.
+    """
+    import flax.nnx as nnx
+    
+    # We must operate directly on the amp_model inside a jitted function
+    # but since this function might be called inside a JIT, we should
+    # use functional split/merge to be safe with state.
+    amp_model = getattr(wf, 'amp_model', getattr(wf, 'model', getattr(getattr(wf, 'model', None), 'amp_model', None)))
+    if hasattr(wf.model, 'amp_model'):
+        amp_model = wf.model.amp_model
+    graphdef, state = nnx.split(amp_model)
+    
+    def generate_batch(state_val, t_val, prng_val):
+        m = nnx.merge(graphdef, state_val)
+        
+        init_x = jnp.zeros((batch_size, n_sites), dtype=jnp.int32)
+        init_kv_cache = m.init_cache(batch_size)
+
+        def step_scan_fn(carry, step_idx):
+            x_curr, prng, kv_cache = carry
+            prng, subkey = jax.random.split(prng)
+
+            safe_idx = jnp.maximum(step_idx - 1, 0)
+            prev_token = jax.lax.dynamic_slice_in_dim(x_curr, safe_idx, 1, axis=1)
+
+            current_token = jnp.where(
+                step_idx == 0,
+                jnp.zeros((batch_size, 1), dtype=jnp.int32),
+                prev_token
+            )
+
+            logits, new_kv_cache = m(current_token, t_val, cache=kv_cache, t_index=step_idx)
+            v_t = jax.random.categorical(subkey, logits.squeeze(1), axis=-1)
+            x_next = x_curr.at[:, step_idx].set(v_t)
+            
+            return (x_next, prng, new_kv_cache), None
+
+        init_carry = (init_x, prng_val, init_kv_cache)
+        final_carry, _ = jax.lax.scan(step_scan_fn, init_carry, jnp.arange(n_sites))
+        final_x = final_carry[0]
+        return final_x
+
+    def time_scan_fn(carry, t):
+        prng = carry
+        prng, subk = jax.random.split(prng)
+        # Generate raw samples shape: (B, N)
+        samples = generate_batch(state, t, subk)
+        
+        # To match MCMC shapes (C, S, N) where C=1, S=batch_size
+        samples = samples.reshape((1, batch_size, n_sites))
+        
+        # Dummy stats
+        stats = {"acceptance_rate": jnp.asarray(1.0, dtype=jnp.float32)}
+        return prng, (samples, stats)
+
+    _, (all_samples, all_stats) = jax.lax.scan(time_scan_fn, key, times)
+    
+    # Final configs shape: (C, N)
+    final_configs = all_samples[-1, :, -1, :]
+    
+    return all_samples, all_stats, final_configs

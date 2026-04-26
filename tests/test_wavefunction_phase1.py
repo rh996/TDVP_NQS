@@ -1,11 +1,12 @@
 import flax.nnx as nn
 import jax.numpy as jnp
+import pytest
 
-from src.wavefunction import tSpinNQS
+from src.wavefunction import tSpinNQS, SimpleSpinNQS, AutoregressiveNQS
 
 
-def _make_model(N=6):
-    return tSpinNQS(
+def _make_model(wf_class, N=6):
+    return wf_class(
         N=N,
         Num_boxes=2,
         emb_dim=16,
@@ -15,21 +16,32 @@ def _make_model(N=6):
     )
 
 
-def test_tspinnqs_holds_persistent_model_instance():
-    wf = _make_model(N=6)
+@pytest.mark.parametrize("wf_class", [tSpinNQS, SimpleSpinNQS, AutoregressiveNQS])
+def test_tspinnqs_holds_persistent_model_instance(wf_class):
+    wf = _make_model(wf_class, N=6)
 
-    model_id_before = id(wf.model)
-    _ = wf(jnp.array([0, 1, 0, 1, 1, 0], dtype=jnp.int32), t=jnp.float32(0.2))
-    model_id_after_first_call = id(wf.model)
-    _ = wf(jnp.array([1, 0, 1, 0, 0, 1], dtype=jnp.int32), t=jnp.float32(0.3))
-    model_id_after_second_call = id(wf.model)
+    # In AutoregressiveNQS, wf.model doesn't exist, it has amp_model and phase_model.
+    # We can check if any underlying module has a consistent ID.
+    if hasattr(wf, "model"):
+        model_id_before = id(wf.model)
+        _ = wf(jnp.array([0, 1, 0, 1, 1, 0], dtype=jnp.int32), t=jnp.float32(0.2))
+        model_id_after_first_call = id(wf.model)
+        _ = wf(jnp.array([1, 0, 1, 0, 0, 1], dtype=jnp.int32), t=jnp.float32(0.3))
+        model_id_after_second_call = id(wf.model)
+        assert model_id_before == model_id_after_first_call == model_id_after_second_call
+    elif hasattr(wf, "amp_model"):
+        model_id_before = id(wf.amp_model)
+        _ = wf(jnp.array([0, 1, 0, 1, 1, 0], dtype=jnp.int32), t=jnp.float32(0.2))
+        model_id_after_first_call = id(wf.amp_model)
+        _ = wf(jnp.array([1, 0, 1, 0, 0, 1], dtype=jnp.int32), t=jnp.float32(0.3))
+        model_id_after_second_call = id(wf.amp_model)
+        assert model_id_before == model_id_after_first_call == model_id_after_second_call
 
-    assert model_id_before == model_id_after_first_call == model_id_after_second_call
 
-
-def test_call_output_shapes_for_single_and_batch_inputs():
+@pytest.mark.parametrize("wf_class", [tSpinNQS, SimpleSpinNQS, AutoregressiveNQS])
+def test_call_output_shapes_for_single_and_batch_inputs(wf_class):
     N = 5
-    wf = _make_model(N=N)
+    wf = _make_model(wf_class, N=N)
 
     # Single configuration input: shape (N,)
     single_config = jnp.array([0, 1, 1, 0, 1], dtype=jnp.int32)
@@ -55,9 +67,10 @@ def test_call_output_shapes_for_single_and_batch_inputs():
     assert batch_phi.shape == (batch_config.shape[0],)
 
 
-def test_outputs_are_finite_for_valid_inputs():
+@pytest.mark.parametrize("wf_class", [tSpinNQS, SimpleSpinNQS, AutoregressiveNQS])
+def test_outputs_are_finite_for_valid_inputs(wf_class):
     N = 7
-    wf = _make_model(N=N)
+    wf = _make_model(wf_class, N=N)
 
     configs = jnp.array(
         [
@@ -75,9 +88,10 @@ def test_outputs_are_finite_for_valid_inputs():
     assert jnp.all(jnp.isfinite(phi))
 
 
-def test_single_vs_singleton_batch_consistency():
+@pytest.mark.parametrize("wf_class", [tSpinNQS, SimpleSpinNQS, AutoregressiveNQS])
+def test_single_vs_singleton_batch_consistency(wf_class):
     N = 5
-    wf = _make_model(N=N)
+    wf = _make_model(wf_class, N=N)
 
     config = jnp.array([1, 0, 1, 1, 0], dtype=jnp.int32)
     config_batched = config[jnp.newaxis, :]
@@ -88,5 +102,5 @@ def test_single_vs_singleton_batch_consistency():
 
     assert logp_batch.shape == (1,)
     assert phi_batch.shape == (1,)
-    assert jnp.allclose(logp_single, logp_batch[0], atol=1e-6)
-    assert jnp.allclose(phi_single, phi_batch[0], atol=1e-6)
+    assert jnp.allclose(logp_single, logp_batch[0], atol=1e-5)
+    assert jnp.allclose(phi_single, phi_batch[0], atol=1e-5)

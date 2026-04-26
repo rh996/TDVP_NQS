@@ -26,6 +26,7 @@ from src.loss import tdvp_residual_loss
 from src.sampler import (
     metropolis_hastings_sample,
     metropolis_hastings_trajectory,
+    autoregressive_trajectory_sample,
 )
 from src.wavefunction import Wavefunction, tSpinNQS
 
@@ -410,17 +411,25 @@ def train_loop(
     # --- Target logp for IC anchoring (Stability improvement) ---
     ic_target_logp = 0.0
     if config.pretrain_steps > 0 or config.lambda_ic > 0.0:
-        # Forward once with random bits to get a baseline mean logp for the initial model.
-        rng, ic_target_rng = jax.random.split(rng)
-        baseline_configs = jax.random.randint(
-            ic_target_rng, (config.batch_size, config.N), 0, 2
-        )
-        initial_logp, _ = wf(baseline_configs, 0.0)
-        ic_target_logp = float(jnp.mean(initial_logp))
-        if verbose:
-            print(
-                f"Initial condition anchoring baseline logp set to: {ic_target_logp:.6f}"
+        if hasattr(wf.model, 'amp_model'):
+            # Autoregressive models output exact probabilities. Target must be exactly uniform.
+            ic_target_logp = float(-config.N * jnp.log(2.0))
+            if verbose:
+                print(
+                    f"Initial condition anchoring exact AR target logp set to: {ic_target_logp:.6f}"
+                )
+        else:
+            # Forward once with random bits to get a baseline mean logp for the initial model.
+            rng, ic_target_rng = jax.random.split(rng)
+            baseline_configs = jax.random.randint(
+                ic_target_rng, (config.batch_size, config.N), 0, 2
             )
+            initial_logp, _ = wf(baseline_configs, 0.0)
+            ic_target_logp = float(jnp.mean(initial_logp))
+            if verbose:
+                print(
+                    f"Initial condition anchoring baseline logp set to: {ic_target_logp:.6f}"
+                )
 
     # 2) Pretraining Phase (Optional)
     if config.pretrain_steps > 0:
@@ -508,20 +517,30 @@ def train_loop(
     def jitted_trajectory_train_step(model, opt_st, configs, rng_val):
         wf_view = _ModelWavefunctionView(model)
 
-        # 1) Sample spacetime trajectory (warm-started)
+        # 1) Sample spacetime trajectory (warm-started or autoregressive)
         # all_samples: (T_active, C, S, N)
         # next_configs: (C, N)
         rng_val, rng_sample = jax.random.split(rng_val)
-        all_samples, all_stats, next_configs = metropolis_hastings_trajectory(
-            wf=wf_view,
-            initial_configurations=configs,
-            times=active_times,
-            n_sites=ham.N,
-            n_samples=config.n_samples_per_chain,
-            burn_in=config.burn_in,
-            thinning=config.thinning,
-            key=rng_sample,
-        )
+        
+        if hasattr(model, 'amp_model'):
+            all_samples, all_stats, next_configs = autoregressive_trajectory_sample(
+                wf=wf_view,
+                times=active_times,
+                n_sites=ham.N,
+                batch_size=config.n_chains * config.n_samples_per_chain,
+                key=rng_sample,
+            )
+        else:
+            all_samples, all_stats, next_configs = metropolis_hastings_trajectory(
+                wf=wf_view,
+                initial_configurations=configs,
+                times=active_times,
+                n_sites=ham.N,
+                n_samples=config.n_samples_per_chain,
+                burn_in=config.burn_in,
+                thinning=config.thinning,
+                key=rng_sample,
+            )
 
         # Reshape for unified gradient computation
         # T_active is the number of time slices being optimized jointly

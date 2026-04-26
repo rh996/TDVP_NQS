@@ -388,3 +388,179 @@ class SimpleSpinNQS(Wavefunction):
         if x.ndim > 1 and x.shape[-1] == 1:
             return jnp.squeeze(x, axis=-1)
         return x
+
+
+class CausalTransformerLayer(nn.Module):
+    def __init__(self, feature_dim, num_heads, head_dim, out_dim, rngs: nn.Rngs):
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.proj_dim = num_heads * head_dim
+        self.q_proj = nn.Linear(feature_dim, self.proj_dim, rngs=rngs, use_bias=False)
+        self.k_proj = nn.Linear(feature_dim, self.proj_dim, rngs=rngs, use_bias=False)
+        self.v_proj = nn.Linear(feature_dim, self.proj_dim, rngs=rngs, use_bias=False)
+        self.out_proj = nn.Linear(self.proj_dim, out_dim, rngs=rngs, use_bias=False)
+
+    def __call__(self, x: jnp.ndarray, cache=None, t_index=None):
+        batch, seq, _ = x.shape
+        q = self.q_proj(x).reshape(batch, seq, self.num_heads, self.head_dim)
+        k = self.k_proj(x).reshape(batch, seq, self.num_heads, self.head_dim)
+        v = self.v_proj(x).reshape(batch, seq, self.num_heads, self.head_dim)
+
+        if cache is not None:
+            k_cache, v_cache = cache
+            k_cache = jax.lax.dynamic_update_slice_in_dim(k_cache, k, t_index, axis=1)
+            v_cache = jax.lax.dynamic_update_slice_in_dim(v_cache, v, t_index, axis=1)
+            new_cache = (k_cache, v_cache)
+            
+            attn_logits = jnp.einsum("bqhd,bkhd->bhqk", q, k_cache) / jnp.sqrt(self.head_dim)
+            
+            k_indices = jnp.arange(k_cache.shape[1])
+            mask = k_indices[None, None, None, :] > t_index
+            attn_logits = jnp.where(mask, -1e9, attn_logits)
+            
+            attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+            attn = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v_cache)
+            attn = attn.reshape(batch, seq, -1)
+            out = self.out_proj(attn)
+            return out, new_cache
+        else:
+            attn_logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) / jnp.sqrt(self.head_dim)
+            mask = jnp.tril(jnp.ones((seq, seq)))[None, None, :, :]
+            attn_logits = jnp.where(mask == 1, attn_logits, -1e9)
+            
+            attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+            attn = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v)
+            attn = attn.reshape(batch, seq, -1)
+            out = self.out_proj(attn)
+            return out, None
+
+
+class CausalBoxLayer(nn.Module):
+    def __init__(self, feature_dim, num_heads, head_dim, rngs: nn.Rngs):
+        self.feature_dim = feature_dim
+        self.layernorm = nn.LayerNorm(self.feature_dim, rngs=rngs)
+        self.layernorm2 = nn.LayerNorm(self.feature_dim, rngs=rngs)
+        self.transformer = CausalTransformerLayer(
+            self.feature_dim, num_heads, head_dim, self.feature_dim, rngs
+        )
+        self.ffn = nn.Linear(
+            self.feature_dim,
+            self.feature_dim,
+            kernel_init=nn.initializers.kaiming_normal(),
+            rngs=rngs,
+        )
+
+    def __call__(self, x: jnp.ndarray, cache=None, t_index=None):
+        x_norm = self.layernorm(x)
+        attn_out, new_cache = self.transformer(x_norm, cache, t_index)
+        x = x + attn_out
+        x = x + jax.nn.tanh(self.ffn(self.layernorm2(x)))
+        return x, new_cache
+
+
+class AutoregressiveAmpModel(nn.Module):
+    def __init__(self, N, Num_boxes, emb_dim, num_heads, head_dim, rngs: nn.Rngs):
+        self.N = N
+        self.spin_embeds = nn.Embed(3, emb_dim, rngs=rngs) # 0, 1, 2=SOS
+        self.pos_embeds = nn.Embed(N, emb_dim, rngs=rngs)
+        
+        self.time_mlp1 = nn.Linear(1, emb_dim, rngs=rngs)
+        self.time_mlp2 = nn.Linear(emb_dim, emb_dim, rngs=rngs)
+        
+        self.layers = nn.data([])
+        for _ in range(Num_boxes):
+            self.layers.append(CausalBoxLayer(emb_dim, num_heads, head_dim, rngs=rngs))
+            
+        self.logits_out = nn.Linear(emb_dim, 2, rngs=rngs)
+
+    def __call__(self, configuration: jnp.ndarray, t: jnp.float32, cache=None, t_index=None):
+        configuration = jnp.asarray(configuration)
+        batch_dim = configuration.shape[0]
+        
+        if cache is None:
+            sos_tokens = jnp.full((batch_dim, 1), 2, dtype=jnp.int32)
+            inputs = jnp.concatenate([sos_tokens, configuration[:, :-1]], axis=1)
+            positions = jnp.arange(self.N)[jnp.newaxis, :].repeat(batch_dim, axis=0)
+        else:
+            inputs = jnp.where(t_index == 0, jnp.full((batch_dim, 1), 2, dtype=jnp.int32), configuration)
+            positions = jnp.full((batch_dim, 1), t_index, dtype=jnp.int32)
+            
+        x = self.spin_embeds(inputs) + self.pos_embeds(positions)
+        
+        t_val = jnp.full((batch_dim, 1), t)
+        t_feat = jax.nn.gelu(self.time_mlp1(t_val))
+        t_feat = jax.nn.gelu(self.time_mlp2(t_feat))
+        t_feat = t_feat[:, jnp.newaxis, :]
+        x = x + t_feat
+        
+        new_caches = []
+        for i, layer in enumerate(self.layers):
+            layer_cache = cache[i] if cache is not None else None
+            x, nc = layer(x, layer_cache, t_index)
+            if nc is not None:
+                new_caches.append(nc)
+                
+        logits = self.logits_out(x)
+        return logits, tuple(new_caches) if cache is not None else None
+
+    def init_cache(self, batch_size):
+        caches = []
+        for layer in self.layers:
+            num_heads = layer.transformer.num_heads
+            head_dim = layer.transformer.head_dim
+            k_cache = jnp.zeros((batch_size, self.N, num_heads, head_dim), dtype=jnp.float32)
+            v_cache = jnp.zeros((batch_size, self.N, num_heads, head_dim), dtype=jnp.float32)
+            caches.append((k_cache, v_cache))
+        return tuple(caches)
+
+
+class AutoregressiveNQSModel(nn.Module):
+    def __init__(self, N, Num_boxes, emb_dim, num_heads, head_dim, rngs: nn.Rngs):
+        self.amp_model = AutoregressiveAmpModel(N, Num_boxes, emb_dim, num_heads, head_dim, rngs=rngs)
+        self.phase_model = tNQS(N, Num_boxes, emb_dim, num_heads, head_dim, rngs=rngs)
+
+    def __call__(self, configuration: jnp.ndarray, t: jnp.float32):
+        configuration = jnp.asarray(configuration)
+        is_single = configuration.ndim == 1
+        if is_single:
+            configuration = configuration[None, ...]
+
+        logits, _ = self.amp_model(configuration, t, cache=None)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        selected_log_probs = jnp.take_along_axis(log_probs, configuration[..., None], axis=-1).squeeze(-1)
+        logp = jnp.sum(selected_log_probs, axis=1)
+        
+        _, phi = self.phase_model(configuration, t)
+        
+        return logp, phi
+
+class AutoregressiveNQS(Wavefunction):
+    """Autoregressive Wavefunction using AR for amplitude and Static for phase."""
+
+    def __init__(
+        self,
+        N: int,
+        Num_boxes: int,
+        emb_dim: int,
+        num_heads: int,
+        head_dim: int,
+        rngs: nn.Rngs,
+    ):
+        self.N = N
+        self.Num_boxes = Num_boxes
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.rngs = rngs
+        
+        self.model = AutoregressiveNQSModel(N, Num_boxes, emb_dim, num_heads, head_dim, rngs=rngs)
+
+    def __call__(self, configuration: jnp.ndarray, t: jnp.float32):
+        logp, phi = self.model(configuration, t)
+        return self._squeeze_last_dim(logp), self._squeeze_last_dim(phi)
+
+    @staticmethod
+    def _squeeze_last_dim(x: jnp.ndarray) -> jnp.ndarray:
+        if x.ndim > 1 and x.shape[-1] == 1:
+            return jnp.squeeze(x, axis=-1)
+        return x
