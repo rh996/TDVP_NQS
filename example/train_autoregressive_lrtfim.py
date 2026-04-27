@@ -17,7 +17,10 @@ import matplotlib.pyplot as plt
 
 from src.grad import _ModelWavefunctionView
 from src.hamiltonian import LongRangeTransverseIsingHamiltonian
-from src.observables import sample_and_measure_energy_curve, sample_and_measure_observables
+from src.observables import (
+    sample_and_measure_energy_curve,
+    sample_and_measure_observables,
+)
 from src.TDVP import TrainingConfig, save_training_checkpoint, train_loop
 from src.wavefunction import AutoregressiveNQS
 
