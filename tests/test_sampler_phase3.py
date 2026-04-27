@@ -94,6 +94,38 @@ def test_autoregressive_trajectory_preserves_chain_shape():
     assert int(all_stats["n_samples_per_chain"][0]) == n_samples
 
 
+def test_autoregressive_trajectory_unique_counts_are_weighted_batch():
+    key = jax.random.PRNGKey(1)
+    n_sites = 3
+    n_chains = 3
+    n_samples = 4
+    wf = AutoregressiveNQS(
+        N=n_sites,
+        Num_boxes=1,
+        emb_dim=8,
+        num_heads=2,
+        head_dim=4,
+        rngs=nnx.Rngs(1),
+    )
+
+    all_samples, all_stats, final_configs = autoregressive_trajectory_sample(
+        wf=wf,
+        times=jnp.array([0.0, 0.25], dtype=jnp.float32),
+        n_sites=n_sites,
+        batch_size=n_chains * n_samples,
+        key=key,
+        n_chains=n_chains,
+        use_unique=True,
+    )
+
+    assert all_samples.shape == (2, n_chains, n_samples, n_sites)
+    assert final_configs.shape == (n_chains, n_sites)
+    assert all_stats["sample_counts"].shape == (2, n_chains, n_samples)
+    assert jnp.all(jnp.sum(all_stats["sample_counts"], axis=(1, 2)) == n_chains * n_samples)
+    assert jnp.all(all_stats["unique_count"] <= 2**n_sites)
+    assert jnp.all(all_stats["unique_fraction"] <= 1.0)
+
+
 def test_sampler_shapes_and_bit_domain_single_chain():
     key = jax.random.PRNGKey(0)
     wf = DummyWF(alpha=0.2, beta=0.1)

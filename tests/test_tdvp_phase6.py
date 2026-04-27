@@ -6,7 +6,7 @@ import optax
 from src.TDVP import TrainingConfig, _create_optimizer, train_loop
 from src.hamiltonian import TransverseIsingHamiltonian
 from src.sampler import metropolis_hastings_trajectory
-from src.wavefunction import tSpinNQS
+from src.wavefunction import AutoregressiveNQS, tSpinNQS
 
 
 def _make_config():
@@ -108,6 +108,15 @@ def test_train_loop_validates_configuration():
     except ValueError as e:
         assert "learning_rate must be > 0" in str(e)
 
+    bad = _make_config()
+    bad.gradient_clip_norm = 0.0
+
+    try:
+        train_loop(bad, verbose=False)
+        assert False, "Expected ValueError for invalid gradient clip norm."
+    except ValueError as e:
+        assert "gradient_clip_norm must be > 0" in str(e)
+
 
 def test_train_loop_supports_muon_optimizer():
     config = _make_config()
@@ -129,3 +138,52 @@ def test_train_loop_with_anchoring():
     
     result = train_loop(config, verbose=False)
     assert len(result["metrics_history"]["loss"]) == 1
+
+
+def test_train_loop_supports_gradient_clipping():
+    config = _make_config()
+    config.gradient_clip_norm = 0.1
+    config.n_steps = 1
+
+    result = train_loop(config, verbose=False)
+
+    assert result["optimizer"] is not None
+    assert result["opt_state"] is not None
+    assert len(result["metrics_history"]["loss"]) == 1
+    assert result["config"].gradient_clip_norm == 0.1
+
+
+def test_train_loop_supports_unique_autoregressive_samples():
+    config = TrainingConfig(
+        N=3,
+        J=-1.0,
+        h=0.5,
+        Num_boxes=1,
+        emb_dim=8,
+        num_heads=2,
+        head_dim=4,
+        learning_rate=1e-3,
+        n_steps=1,
+        n_samples_per_chain=2,
+        burn_in=0,
+        thinning=1,
+        n_chains=2,
+        time_steps=2,
+        use_unique_ar_samples=True,
+        seed=0,
+    )
+    wf = AutoregressiveNQS(
+        N=config.N,
+        Num_boxes=config.Num_boxes,
+        emb_dim=config.emb_dim,
+        num_heads=config.num_heads,
+        head_dim=config.head_dim,
+        rngs=nnx.Rngs(config.seed),
+    )
+
+    result = train_loop(config, verbose=False, initial_wavefunction=wf)
+
+    assert result["final_configurations"].shape == (config.n_chains, config.N)
+    assert len(result["metrics_history"]["loss"]) == 1
+    assert len(result["metrics_history"]["ar_unique_count"]) == 1
+    assert result["metrics_history"]["ar_unique_fraction"][0] <= 1.0

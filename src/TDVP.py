@@ -21,14 +21,14 @@ from src.grad import (
     tdvp_vmc_gradient,
     tdvp_vmc_trajectory_gradient,
 )
-from src.hamiltonian import TransverseIsingHamiltonian
+from src.hamiltonian import LongRangeTransverseIsingHamiltonian, TransverseIsingHamiltonian
 from src.loss import tdvp_residual_loss
 from src.sampler import (
     metropolis_hastings_sample,
     metropolis_hastings_trajectory,
     autoregressive_trajectory_sample,
 )
-from src.wavefunction import Wavefunction, tSpinNQS
+from src.wavefunction import AutoregressiveNQS, SimpleSpinNQS, Wavefunction, tSpinNQS
 
 
 @dataclass
@@ -53,6 +53,7 @@ class TrainingConfig:
     adamw_b2: float = 0.999
     adamw_eps: float = 1e-8
     weight_decay: float = 1e-4
+    gradient_clip_norm: Optional[float] = None
     n_steps: int = 100
     batch_size: int = 32
 
@@ -61,6 +62,7 @@ class TrainingConfig:
     burn_in: int = 100
     thinning: int = 1
     n_chains: int = 1
+    use_unique_ar_samples: bool = False
     initial_chain_configurations: Optional[Any] = None
 
     # Time
@@ -103,6 +105,10 @@ def _validate_training_config(config: TrainingConfig) -> None:
         raise ValueError(f"adamw_eps must be > 0, got {config.adamw_eps}")
     if config.weight_decay < 0:
         raise ValueError(f"weight_decay must be >= 0, got {config.weight_decay}")
+    if config.gradient_clip_norm is not None and config.gradient_clip_norm <= 0:
+        raise ValueError(
+            f"gradient_clip_norm must be > 0 when set, got {config.gradient_clip_norm}"
+        )
     if config.n_chains <= 0:
         raise ValueError(f"n_chains must be > 0, got {config.n_chains}")
     if config.n_samples_per_chain <= 0:
@@ -193,6 +199,8 @@ def _default_metrics_history() -> Dict[str, list]:
         "finite_grads": [],
         "e_real_mean": [],
         "e_imag_mean": [],
+        "ar_unique_count": [],
+        "ar_unique_fraction": [],
         "time": [],
         "step": [],
     }
@@ -202,19 +210,19 @@ def _create_optimizer(config: TrainingConfig) -> optax.GradientTransformation:
     """Build the optimizer configured for TDVP training."""
     optimizer_name = config.optimizer_name.lower()
     if optimizer_name == "adamw":
-        return optax.adamw(
+        optimizer = optax.adamw(
             learning_rate=config.learning_rate,
             b1=config.adamw_b1,
             b2=config.adamw_b2,
             eps=config.adamw_eps,
             weight_decay=config.weight_decay,
         )
-    if optimizer_name == "muon":
+    elif optimizer_name == "muon":
         if optax_muon is None:
             raise RuntimeError(
                 "Muon optimizer is not available in the installed optax package."
             )
-        return optax_muon(
+        optimizer = optax_muon(
             learning_rate=config.learning_rate,
             ns_coeffs="standard",
             ns_steps=5,
@@ -228,8 +236,17 @@ def _create_optimizer(config: TrainingConfig) -> optax.GradientTransformation:
             muon_weight_dimension_numbers=None,
             consistent_rms=0.2,
         )
-    raise ValueError(
-        f"Unsupported optimizer_name {config.optimizer_name!r}; only 'adamw' and 'muon' are currently supported."
+    else:
+        raise ValueError(
+            f"Unsupported optimizer_name {config.optimizer_name!r}; only 'adamw' and 'muon' are currently supported."
+        )
+
+    if config.gradient_clip_norm is None:
+        return optimizer
+
+    return optax.chain(
+        optax.clip_by_global_norm(config.gradient_clip_norm),
+        optimizer,
     )
 
 
@@ -254,16 +271,24 @@ def save_training_checkpoint(
         lambda x: np.asarray(x),
         nnx.state(wf.model, nnx.Param),
     )
+    hamiltonian_payload = {
+        "J": float(ham.J),
+        "h": float(ham.h),
+        "N": int(ham.N),
+    }
+    if isinstance(ham, LongRangeTransverseIsingHamiltonian):
+        hamiltonian_payload["type"] = "long_range_tfim"
+        hamiltonian_payload["alpha"] = float(ham.alpha)
+    else:
+        hamiltonian_payload["type"] = "tfim"
+
     payload = {
         "model_state": model_state,
+        "wavefunction_type": type(wf).__name__,
         "optimizer_state": None
         if opt_state is None
         else jax.tree_util.tree_map(lambda x: np.asarray(x), opt_state),
-        "hamiltonian": {
-            "J": float(ham.J),
-            "h": float(ham.h),
-            "N": int(ham.N),
-        },
+        "hamiltonian": hamiltonian_payload,
         "config": asdict(config),
         "metrics_history": metrics_history,
         "global_step": int(global_step),
@@ -283,7 +308,16 @@ def load_training_checkpoint(filepath: str) -> Dict[str, Any]:
         payload = pickle.load(f)
 
     config = TrainingConfig(**payload["config"])
-    wf = tSpinNQS(
+    wavefunction_type = payload.get("wavefunction_type", "tSpinNQS")
+    wavefunction_cls = {
+        "tSpinNQS": tSpinNQS,
+        "SimpleSpinNQS": SimpleSpinNQS,
+        "AutoregressiveNQS": AutoregressiveNQS,
+    }.get(wavefunction_type)
+    if wavefunction_cls is None:
+        raise ValueError(f"Unsupported wavefunction_type in checkpoint: {wavefunction_type}")
+
+    wf = wavefunction_cls(
         N=config.N,
         Num_boxes=config.Num_boxes,
         emb_dim=config.emb_dim,
@@ -293,7 +327,13 @@ def load_training_checkpoint(filepath: str) -> Dict[str, Any]:
     )
     nnx.update(wf.model, payload["model_state"])
 
-    ham = TransverseIsingHamiltonian(**payload["hamiltonian"])
+    hamiltonian_payload = dict(payload["hamiltonian"])
+    hamiltonian_type = hamiltonian_payload.pop("type", "tfim")
+    if hamiltonian_type == "long_range_tfim":
+        ham = LongRangeTransverseIsingHamiltonian(**hamiltonian_payload)
+    else:
+        hamiltonian_payload.pop("alpha", None)
+        ham = TransverseIsingHamiltonian(**hamiltonian_payload)
 
     return {
         "wavefunction": wf,
@@ -530,6 +570,7 @@ def train_loop(
                 batch_size=config.n_chains * config.n_samples_per_chain,
                 key=rng_sample,
                 n_chains=config.n_chains,
+                use_unique=config.use_unique_ar_samples,
             )
         else:
             all_samples, all_stats, next_configs = metropolis_hastings_trajectory(
@@ -548,6 +589,11 @@ def train_loop(
         T_active = active_times.shape[0]
         batch_size_per_slice = config.n_chains * config.n_samples_per_chain
         all_configs_batch = all_samples.reshape((T_active, batch_size_per_slice, ham.N))
+        sample_weights = None
+        if hasattr(model, 'amp_model') and config.use_unique_ar_samples:
+            sample_weights = all_stats["sample_counts"].reshape(
+                (T_active, batch_size_per_slice)
+            )
 
         # 2) Compute unified spacetime gradient
         grad_total, diag = tdvp_vmc_trajectory_gradient(
@@ -555,10 +601,14 @@ def train_loop(
             wf=wf_view,
             all_configurations=all_configs_batch,
             times=active_times,
+            sample_weights=sample_weights,
         )
 
         # Add sampling diagnostics (mean across active time slices)
         diag["acceptance_rate"] = jnp.mean(all_stats["acceptance_rate"])
+        if hasattr(model, 'amp_model'):
+            diag["ar_unique_count"] = jnp.mean(all_stats["unique_count"])
+            diag["ar_unique_fraction"] = jnp.mean(all_stats["unique_fraction"])
 
         # 3) Initial Condition Anchoring (Lagrangian Penalty at t=0)
         if config.lambda_ic > 0.0:

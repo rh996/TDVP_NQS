@@ -88,6 +88,24 @@ def test_outputs_are_finite_for_valid_inputs(wf_class):
     assert jnp.all(jnp.isfinite(phi))
 
 
+def test_autoregressive_time_mlp_has_residual_third_layer():
+    wf = _make_model(AutoregressiveNQS, N=5)
+    amp_model = wf.model.amp_model
+
+    batch_dim = 3
+    t = jnp.float32(0.25)
+    t_val = jnp.full((batch_dim, 1), t)
+    t_hidden = nn.gelu(amp_model.time_mlp1(t_val))
+    expected = nn.gelu(amp_model.time_mlp3(nn.gelu(amp_model.time_mlp2(t_hidden))))
+    expected = expected + t_hidden
+
+    actual = amp_model._time_features(t, batch_dim)
+
+    assert hasattr(amp_model, "time_mlp3")
+    assert actual.shape == (batch_dim, amp_model.emb_dim)
+    assert jnp.allclose(actual, expected, atol=1e-6)
+
+
 @pytest.mark.parametrize("wf_class", [tSpinNQS, SimpleSpinNQS, AutoregressiveNQS])
 def test_single_vs_singleton_batch_consistency(wf_class):
     N = 5

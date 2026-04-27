@@ -461,17 +461,26 @@ class CausalBoxLayer(nn.Module):
 class AutoregressiveAmpModel(nn.Module):
     def __init__(self, N, Num_boxes, emb_dim, num_heads, head_dim, rngs: nn.Rngs):
         self.N = N
+        self.emb_dim = emb_dim
         self.spin_embeds = nn.Embed(3, emb_dim, rngs=rngs) # 0, 1, 2=SOS
         self.pos_embeds = nn.Embed(N, emb_dim, rngs=rngs)
         
         self.time_mlp1 = nn.Linear(1, emb_dim, rngs=rngs)
         self.time_mlp2 = nn.Linear(emb_dim, emb_dim, rngs=rngs)
+        self.time_mlp3 = nn.Linear(emb_dim, emb_dim, rngs=rngs)
         
         self.layers = nn.data([])
         for _ in range(Num_boxes):
             self.layers.append(CausalBoxLayer(emb_dim, num_heads, head_dim, rngs=rngs))
             
         self.logits_out = nn.Linear(emb_dim, 2, rngs=rngs)
+
+    def _time_features(self, t, batch_dim: int) -> jnp.ndarray:
+        t_val = jnp.full((batch_dim, 1), t)
+        t_hidden = jax.nn.gelu(self.time_mlp1(t_val))
+        t_feat = jax.nn.gelu(self.time_mlp2(t_hidden))
+        t_feat = jax.nn.gelu(self.time_mlp3(t_feat))
+        return t_feat + t_hidden
 
     def __call__(self, configuration: jnp.ndarray, t: jnp.float32, cache=None, t_index=None):
         configuration = jnp.asarray(configuration)
@@ -487,10 +496,7 @@ class AutoregressiveAmpModel(nn.Module):
             
         x = self.spin_embeds(inputs) + self.pos_embeds(positions)
         
-        t_val = jnp.full((batch_dim, 1), t)
-        t_feat = jax.nn.gelu(self.time_mlp1(t_val))
-        t_feat = jax.nn.gelu(self.time_mlp2(t_feat))
-        t_feat = t_feat[:, jnp.newaxis, :]
+        t_feat = self._time_features(t, batch_dim)[:, jnp.newaxis, :]
         x = x + t_feat
         
         new_caches = []

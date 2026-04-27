@@ -2,12 +2,14 @@ from pathlib import Path
 
 import jax.numpy as jnp
 
+from src.hamiltonian import LongRangeTransverseIsingHamiltonian
 from src.TDVP import (
     TrainingConfig,
     load_training_checkpoint,
     save_training_checkpoint,
     train_loop,
 )
+from src.wavefunction import AutoregressiveNQS
 
 
 def _make_config():
@@ -156,3 +158,72 @@ def test_muon_optimizer_state_roundtrip(tmp_path: Path):
     loaded = load_training_checkpoint(str(checkpoint_path))
     assert loaded["optimizer_state"] is not None
     assert loaded["config"].optimizer_name == "muon"
+
+
+def test_long_range_hamiltonian_checkpoint_roundtrip(tmp_path: Path):
+    config = _make_config()
+    config.n_steps = 1
+    ham = LongRangeTransverseIsingHamiltonian(
+        J=config.J,
+        h=config.h,
+        N=config.N,
+        alpha=1.4,
+    )
+    result = train_loop(config, verbose=False, initial_hamiltonian=ham)
+
+    checkpoint_path = tmp_path / "lrtfim_checkpoint.pkl"
+    save_training_checkpoint(
+        str(checkpoint_path),
+        wf=result["wavefunction"],
+        ham=result["hamiltonian"],
+        config=result["config"],
+        metrics_history=result["metrics_history"],
+        global_step=result["global_step"],
+        completed_time_steps=result["completed_time_steps"],
+        current_time=0.0,
+        chain_configurations=result["final_configurations"],
+        rng=result["rng"],
+        opt_state=result["opt_state"],
+    )
+
+    loaded = load_training_checkpoint(str(checkpoint_path))
+
+    assert isinstance(loaded["hamiltonian"], LongRangeTransverseIsingHamiltonian)
+    assert loaded["hamiltonian"].alpha == 1.4
+
+
+def test_autoregressive_wavefunction_checkpoint_roundtrip(tmp_path: Path):
+    import flax.nnx as nnx
+
+    config = _make_config()
+    config.n_steps = 1
+    config.burn_in = 0
+    config.thinning = 1
+    wf = AutoregressiveNQS(
+        N=config.N,
+        Num_boxes=config.Num_boxes,
+        emb_dim=config.emb_dim,
+        num_heads=config.num_heads,
+        head_dim=config.head_dim,
+        rngs=nnx.Rngs(config.seed),
+    )
+    result = train_loop(config, verbose=False, initial_wavefunction=wf)
+
+    checkpoint_path = tmp_path / "ar_checkpoint.pkl"
+    save_training_checkpoint(
+        str(checkpoint_path),
+        wf=result["wavefunction"],
+        ham=result["hamiltonian"],
+        config=result["config"],
+        metrics_history=result["metrics_history"],
+        global_step=result["global_step"],
+        completed_time_steps=result["completed_time_steps"],
+        current_time=0.0,
+        chain_configurations=result["final_configurations"],
+        rng=result["rng"],
+        opt_state=result["opt_state"],
+    )
+
+    loaded = load_training_checkpoint(str(checkpoint_path))
+
+    assert isinstance(loaded["wavefunction"], AutoregressiveNQS)

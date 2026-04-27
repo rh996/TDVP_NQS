@@ -254,3 +254,44 @@ def test_tdvp_vmc_trajectory_gradient_returns_valid_output():
     assert required.issubset(set(diag.keys()))
     assert jnp.isfinite(diag["loss"])
     assert jnp.isfinite(diag["grad_norm_total"])
+
+
+def test_weighted_trajectory_gradient_matches_expanded_duplicates():
+    import jax
+
+    N = 4
+    ham = TransverseIsingHamiltonian(J=1.0, h=0.5, N=N)
+    wf = _make_wf(N=N, seed=7)
+    times = jnp.array([0.0, 0.1], dtype=jnp.float32)
+
+    a = jnp.array([0, 0, 1, 0], dtype=jnp.int32)
+    b = jnp.array([1, 0, 1, 1], dtype=jnp.int32)
+    c = jnp.array([0, 1, 0, 1], dtype=jnp.int32)
+    dense_slice = jnp.stack([a, b, a, c, b, a], axis=0)
+    unique_slice = jnp.stack(
+        [a, b, c, jnp.array([1, 1, 1, 1], dtype=jnp.int32), a, b],
+        axis=0,
+    )
+    counts = jnp.array([3, 2, 1, 0, 0, 0], dtype=jnp.float32)
+
+    dense_configs = jnp.stack([dense_slice, dense_slice], axis=0)
+    unique_configs = jnp.stack([unique_slice, unique_slice], axis=0)
+    sample_weights = jnp.stack([counts, counts], axis=0)
+
+    dense_grad, dense_diag = tdvp_vmc_trajectory_gradient(
+        ham=ham,
+        wf=wf,
+        all_configurations=dense_configs,
+        times=times,
+    )
+    weighted_grad, weighted_diag = tdvp_vmc_trajectory_gradient(
+        ham=ham,
+        wf=wf,
+        all_configurations=unique_configs,
+        times=times,
+        sample_weights=sample_weights,
+    )
+
+    diffs = jax.tree_util.tree_map(lambda x, y: x - y, dense_grad, weighted_grad)
+    assert jnp.allclose(weighted_diag["loss"], dense_diag["loss"], atol=1e-5)
+    assert jnp.allclose(_tree_l2_norm(diffs), 0.0, atol=1e-4)

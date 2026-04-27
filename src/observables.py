@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
 
+from src.hamiltonian import local_energy_batch
 from src.sampler import metropolis_hastings_sample
 from src.wavefunction import Wavefunction
 
@@ -44,6 +45,68 @@ class ObservableEstimates:
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         return cls(*children, n_samples=aux_data)
+
+
+@jax.tree_util.register_pytree_node_class
+@dataclass
+class EnergyEstimates:
+    """Monte Carlo estimate of the Hamiltonian expectation value."""
+
+    energy_real: jnp.ndarray
+    energy_imag: jnp.ndarray
+    energy_per_site_real: jnp.ndarray
+    energy_per_site_imag: jnp.ndarray
+    variance: jnp.ndarray
+    standard_error: jnp.ndarray
+    n_samples: int
+
+    def tree_flatten(self):
+        children = (
+            self.energy_real,
+            self.energy_imag,
+            self.energy_per_site_real,
+            self.energy_per_site_imag,
+            self.variance,
+            self.standard_error,
+        )
+        aux_data = self.n_samples
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children, n_samples=aux_data)
+
+
+@jax.tree_util.register_pytree_node_class
+@dataclass
+class EnergyCurve:
+    """Energy estimates evaluated across a time grid."""
+
+    times: jnp.ndarray
+    energy_real: jnp.ndarray
+    energy_imag: jnp.ndarray
+    energy_per_site_real: jnp.ndarray
+    energy_per_site_imag: jnp.ndarray
+    variance: jnp.ndarray
+    standard_error: jnp.ndarray
+    n_samples: jnp.ndarray
+
+    def tree_flatten(self):
+        children = (
+            self.times,
+            self.energy_real,
+            self.energy_imag,
+            self.energy_per_site_real,
+            self.energy_per_site_imag,
+            self.variance,
+            self.standard_error,
+            self.n_samples,
+        )
+        return (children, None)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
 
 
 def _validate_batch_configs(configurations: jnp.ndarray, n_sites: int) -> jnp.ndarray:
@@ -148,23 +211,55 @@ def measure_observables(
     )
 
 
-def sample_and_measure_observables(
+def measure_energy(
+    ham,
+    wf: Wavefunction,
+    configurations: jnp.ndarray,
+    t,
+    *,
+    n_sites: Optional[int] = None,
+) -> EnergyEstimates:
+    """Estimate <H> from a fixed batch using local-energy samples."""
+    if n_sites is None:
+        n_sites = ham.N
+    configs = _validate_batch_configs(configurations, n_sites)
+
+    e_real, e_imag = local_energy_batch(ham, wf, configs, t)
+    e_real = jnp.asarray(e_real, dtype=jnp.float32)
+    e_imag = jnp.asarray(e_imag, dtype=jnp.float32)
+
+    energy_real = jnp.mean(e_real)
+    energy_imag = jnp.mean(e_imag)
+    centered_abs2 = (e_real - energy_real) ** 2 + (e_imag - energy_imag) ** 2
+    variance = jnp.mean(centered_abs2)
+
+    n_samples = int(configs.shape[0])
+    n_sites_f = float(n_sites)
+
+    return EnergyEstimates(
+        energy_real=energy_real,
+        energy_imag=energy_imag,
+        energy_per_site_real=energy_real / n_sites_f,
+        energy_per_site_imag=energy_imag / n_sites_f,
+        variance=variance,
+        standard_error=jnp.sqrt(variance / float(n_samples)),
+        n_samples=n_samples,
+    )
+
+
+def _sample_wavefunction(
     wf: Wavefunction,
     t,
     *,
     n_sites: int,
     initial_configurations: jnp.ndarray,
     n_samples: int,
-    burn_in: int = 100,
-    thinning: int = 1,
-    key: Optional[jax.Array] = None,
-    return_samples: bool = False,
+    burn_in: int,
+    thinning: int,
+    key: Optional[jax.Array],
 ):
-    """Sample from the wavefunction and estimate <Z> and <X>."""
     if hasattr(wf, 'model') and hasattr(wf.model, 'amp_model'):
         from src.sampler import autoregressive_trajectory_sample
-        # batch_size is n_chains * n_samples_per_chain in MCMC, but the signature here only gives n_samples
-        # and initial_configurations.shape[0] is n_chains
         n_chains = initial_configurations.shape[0]
         batch_size = n_chains * n_samples
         all_samples, sampler_stats, final_configurations = autoregressive_trajectory_sample(
@@ -175,7 +270,7 @@ def sample_and_measure_observables(
             key=key,
             n_chains=n_chains,
         )
-        samples = all_samples[0] # (C, S, N)
+        samples = all_samples[0]
     else:
         samples, sampler_stats = metropolis_hastings_sample(
             wf=wf,
@@ -190,12 +285,151 @@ def sample_and_measure_observables(
         )
         final_configurations = samples[:, -1, :]
 
+    return samples, sampler_stats, final_configurations
+
+
+def sample_and_measure_observables(
+    wf: Wavefunction,
+    t,
+    *,
+    n_sites: int,
+    initial_configurations: jnp.ndarray,
+    n_samples: int,
+    burn_in: int = 100,
+    thinning: int = 1,
+    key: Optional[jax.Array] = None,
+    return_samples: bool = False,
+):
+    """Sample from the wavefunction and estimate <Z> and <X>."""
+    samples, sampler_stats, final_configurations = _sample_wavefunction(
+        wf,
+        t,
+        n_sites=n_sites,
+        initial_configurations=initial_configurations,
+        n_samples=n_samples,
+        burn_in=burn_in,
+        thinning=thinning,
+        key=key,
+    )
+
     flat_samples = samples.reshape((-1, n_sites))
     estimates = measure_observables(wf, flat_samples, t, n_sites=n_sites)
 
     if return_samples:
         return estimates, sampler_stats, final_configurations, samples
     return estimates, sampler_stats, final_configurations
+
+
+def sample_and_measure_energy(
+    ham,
+    wf: Wavefunction,
+    t,
+    *,
+    n_sites: int,
+    initial_configurations: jnp.ndarray,
+    n_samples: int,
+    burn_in: int = 100,
+    thinning: int = 1,
+    key: Optional[jax.Array] = None,
+    return_samples: bool = False,
+):
+    """Sample from the wavefunction and estimate the energy <H>."""
+    samples, sampler_stats, final_configurations = _sample_wavefunction(
+        wf,
+        t,
+        n_sites=n_sites,
+        initial_configurations=initial_configurations,
+        n_samples=n_samples,
+        burn_in=burn_in,
+        thinning=thinning,
+        key=key,
+    )
+
+    flat_samples = samples.reshape((-1, n_sites))
+    estimates = measure_energy(ham, wf, flat_samples, t, n_sites=n_sites)
+
+    if return_samples:
+        return estimates, sampler_stats, final_configurations, samples
+    return estimates, sampler_stats, final_configurations
+
+
+def sample_and_measure_energy_curve(
+    ham,
+    wf: Wavefunction,
+    times: jnp.ndarray,
+    *,
+    n_sites: int,
+    initial_configurations: jnp.ndarray,
+    n_samples: int,
+    burn_in: int = 100,
+    thinning: int = 1,
+    key: Optional[jax.Array] = None,
+    return_samples: bool = False,
+):
+    """Sample each time slice and return an energy curve."""
+    times = jnp.asarray(times, dtype=jnp.float32)
+    if times.ndim != 1:
+        raise ValueError(f"times must be 1D, got {times.shape}")
+    if times.shape[0] == 0:
+        raise ValueError("times must contain at least one time point.")
+
+    if key is None:
+        key = jax.random.PRNGKey(0)
+
+    current_configurations = initial_configurations
+    estimates = []
+    sampler_stats = []
+    samples_by_time = []
+
+    for t_val in times:
+        key, step_key = jax.random.split(key)
+        result = sample_and_measure_energy(
+            ham,
+            wf,
+            t_val,
+            n_sites=n_sites,
+            initial_configurations=current_configurations,
+            n_samples=n_samples,
+            burn_in=burn_in,
+            thinning=thinning,
+            key=step_key,
+            return_samples=True,
+        )
+        energy_estimate, stats, current_configurations, samples = result
+        estimates.append(energy_estimate)
+        sampler_stats.append(stats)
+        samples_by_time.append(samples)
+
+    curve = EnergyCurve(
+        times=times,
+        energy_real=jnp.stack([estimate.energy_real for estimate in estimates]),
+        energy_imag=jnp.stack([estimate.energy_imag for estimate in estimates]),
+        energy_per_site_real=jnp.stack(
+            [estimate.energy_per_site_real for estimate in estimates]
+        ),
+        energy_per_site_imag=jnp.stack(
+            [estimate.energy_per_site_imag for estimate in estimates]
+        ),
+        variance=jnp.stack([estimate.variance for estimate in estimates]),
+        standard_error=jnp.stack([estimate.standard_error for estimate in estimates]),
+        n_samples=jnp.asarray(
+            [estimate.n_samples for estimate in estimates], dtype=jnp.int32
+        ),
+    )
+
+    stacked_stats = jax.tree_util.tree_map(
+        lambda *xs: jnp.stack([jnp.asarray(x) for x in xs]),
+        *sampler_stats,
+    )
+
+    if return_samples:
+        return (
+            curve,
+            stacked_stats,
+            current_configurations,
+            jnp.stack(samples_by_time),
+        )
+    return curve, stacked_stats, current_configurations
 
 
 def enumerate_binary_configurations(n_sites: int) -> jnp.ndarray:

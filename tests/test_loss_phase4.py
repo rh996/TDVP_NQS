@@ -168,6 +168,38 @@ def test_tdvp_residual_loss_matches_manual_centered_variance():
     assert jnp.allclose(diag.e_imag, expected["e_imag"], atol=1e-6)
 
 
+def test_weighted_tdvp_residual_loss_matches_expanded_duplicates():
+    ham = TransverseIsingHamiltonian(J=0.9, h=1.1, N=3)
+    wf = DummyWavefunction(alpha=-0.3, beta=0.2, gamma=0.45, delta=-0.7)
+    t = jnp.float32(0.8)
+
+    a = jnp.array([0, 1, 0], dtype=jnp.int32)
+    b = jnp.array([1, 1, 0], dtype=jnp.int32)
+    c = jnp.array([0, 0, 1], dtype=jnp.int32)
+    dense_configs = jnp.stack([a, b, a, c, b, a], axis=0)
+    unique_configs = jnp.stack(
+        [a, b, c, jnp.array([1, 1, 1], dtype=jnp.int32), a, b],
+        axis=0,
+    )
+    counts = jnp.array([3, 2, 1, 0, 0, 0], dtype=jnp.float32)
+
+    dense_loss, dense_diag = tdvp_residual_loss(
+        ham, wf, dense_configs, t, return_diagnostics=True
+    )
+    weighted_loss, weighted_diag = tdvp_residual_loss(
+        ham,
+        wf,
+        unique_configs,
+        t,
+        return_diagnostics=True,
+        sample_weights=counts,
+    )
+
+    assert jnp.allclose(weighted_loss, dense_loss, atol=1e-6)
+    assert jnp.allclose(weighted_diag.A_mean, dense_diag.A_mean, atol=1e-6)
+    assert jnp.allclose(weighted_diag.B_mean, dense_diag.B_mean, atol=1e-6)
+
+
 def test_tdvp_residual_loss_without_diagnostics_returns_scalar():
     ham = TransverseIsingHamiltonian(J=0.0, h=0.5, N=4)
     wf = DummyWavefunction(alpha=0.1, beta=0.2, gamma=0.3, delta=0.4)

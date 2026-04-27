@@ -242,6 +242,7 @@ def autoregressive_trajectory_sample(
     batch_size: int,
     key: jax.Array,
     n_chains: int = 1,
+    use_unique: bool = False,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray], jnp.ndarray]:
     """Sample an autoregressive trajectory exactly directly without MCMC.
     
@@ -303,20 +304,41 @@ def autoregressive_trajectory_sample(
         prng, subk = jax.random.split(prng)
         # Generate raw samples shape: (B, N)
         samples = generate_batch(state, t, subk)
+        next_configs = samples.reshape((n_chains, n_samples_per_chain, n_sites))[
+            :, -1, :
+        ]
+
+        if use_unique:
+            samples, sample_counts = jnp.unique(
+                samples,
+                axis=0,
+                return_counts=True,
+                size=batch_size,
+                fill_value=0,
+            )
+        else:
+            sample_counts = jnp.ones((batch_size,), dtype=jnp.int32)
         
         # Match the MCMC shape contract while preserving dense AR generation.
         samples = samples.reshape((n_chains, n_samples_per_chain, n_sites))
+        sample_counts = sample_counts.reshape((n_chains, n_samples_per_chain))
         
         stats = {
             "acceptance_rate": jnp.ones((n_chains,), dtype=jnp.float32),
             "n_chains": jnp.asarray(n_chains, dtype=jnp.int32),
             "n_samples_per_chain": jnp.asarray(n_samples_per_chain, dtype=jnp.int32),
+            "sample_counts": sample_counts,
+            "unique_count": jnp.sum(sample_counts > 0),
+            "unique_fraction": jnp.sum(sample_counts > 0).astype(jnp.float32)
+            / jnp.asarray(batch_size, dtype=jnp.float32),
         }
-        return prng, (samples, stats)
+        return prng, (samples, stats, next_configs)
 
-    _, (all_samples, all_stats) = jax.lax.scan(time_scan_fn, key, times)
+    _, (all_samples, all_stats, all_next_configs) = jax.lax.scan(
+        time_scan_fn, key, times
+    )
     
     # Final configs shape: (C, N)
-    final_configs = all_samples[-1, :, -1, :]
+    final_configs = all_next_configs[-1]
     
     return all_samples, all_stats, final_configs

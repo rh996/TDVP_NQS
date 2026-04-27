@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -70,6 +70,39 @@ def _as_scalar_like(x: jnp.ndarray, name: str) -> jnp.ndarray:
     if arr.ndim == 2 and arr.shape == (1, 1):
         return arr[0, 0]
     raise ValueError(f"{name} must be scalar-like for one sample, got {arr.shape}")
+
+
+def _normalize_sample_weights(
+    sample_weights: Optional[jnp.ndarray],
+    batch_size: int,
+) -> Optional[jnp.ndarray]:
+    """Return normalized nonnegative sample weights, or None for uniform weights."""
+    if sample_weights is None:
+        return None
+
+    weights = jnp.asarray(sample_weights, dtype=jnp.float32)
+    if weights.ndim != 1:
+        raise ValueError(f"sample_weights must be 1D, got {weights.shape}")
+    if weights.shape[0] != batch_size:
+        raise ValueError(
+            f"sample_weights length must match batch size {batch_size}, got {weights.shape[0]}"
+        )
+    if not isinstance(weights, jax.core.Tracer):
+        if not jnp.all(weights >= 0):
+            raise ValueError("sample_weights must be nonnegative.")
+        if not jnp.sum(weights) > 0:
+            raise ValueError("sample_weights must contain at least one positive entry.")
+
+    total = jnp.sum(weights)
+    return weights / total
+
+
+def _weighted_mean(values: jnp.ndarray, weights: Optional[jnp.ndarray]) -> jnp.ndarray:
+    """Mean over the batch axis with optional normalized weights."""
+    values = jnp.asarray(values)
+    if weights is None:
+        return jnp.mean(values)
+    return jnp.sum(values * weights)
 
 
 def _time_derivatives_single(
@@ -153,6 +186,7 @@ def tdvp_residual_loss(
     t,
     *,
     return_diagnostics: bool = True,
+    sample_weights: Optional[jnp.ndarray] = None,
 ):
     """Compute Monte Carlo TDVP residual variance loss.
 
@@ -161,11 +195,13 @@ def tdvp_residual_loss(
     """
     A, B, extras = tdvp_residual_components(ham, wf, configurations, t)
 
-    A_mean = jnp.mean(A)
-    B_mean = jnp.mean(B)
+    weights = _normalize_sample_weights(sample_weights, A.shape[0])
+
+    A_mean = _weighted_mean(A, weights)
+    B_mean = _weighted_mean(B, weights)
 
     ell = (A - A_mean) ** 2 + (B - B_mean) ** 2
-    loss = jnp.mean(ell)
+    loss = _weighted_mean(ell, weights)
 
     if not return_diagnostics:
         return loss

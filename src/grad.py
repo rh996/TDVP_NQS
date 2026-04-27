@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -129,14 +129,61 @@ def _as_scalar_like(x: jnp.ndarray, name: str) -> jnp.ndarray:
     raise ValueError(f"{name} must be scalar-like for one sample, got {arr.shape}")
 
 
+def _normalize_sample_weights(
+    sample_weights: Optional[jnp.ndarray],
+    batch_size: int,
+) -> Optional[jnp.ndarray]:
+    """Return normalized nonnegative sample weights, or None for uniform weights."""
+    if sample_weights is None:
+        return None
+
+    weights = jnp.asarray(sample_weights, dtype=jnp.float32)
+    if weights.ndim != 1:
+        raise ValueError(f"sample_weights must be 1D, got {weights.shape}")
+    if weights.shape[0] != batch_size:
+        raise ValueError(
+            f"sample_weights length must match batch size {batch_size}, got {weights.shape[0]}"
+        )
+    if not isinstance(weights, jax.core.Tracer):
+        if not jnp.all(weights >= 0):
+            raise ValueError("sample_weights must be nonnegative.")
+        if not jnp.sum(weights) > 0:
+            raise ValueError("sample_weights must contain at least one positive entry.")
+
+    return weights / jnp.sum(weights)
+
+
+def _weighted_mean_array(
+    values: jnp.ndarray,
+    weights: Optional[jnp.ndarray],
+) -> jnp.ndarray:
+    values = jnp.asarray(values)
+    if weights is None:
+        return jnp.mean(values, axis=0)
+    weight_shape = (weights.shape[0],) + (1,) * (values.ndim - 1)
+    return jnp.sum(values * weights.reshape(weight_shape), axis=0)
+
+
+def _weighted_mean_tree(tree: PyTree, weights: Optional[jnp.ndarray]) -> PyTree:
+    return jax.tree_util.tree_map(lambda x: _weighted_mean_array(x, weights), tree)
+
+
 def _batch_loss_fn(
     ham: TransverseIsingHamiltonian,
     wf: Wavefunction,
     configurations: jnp.ndarray,
     t,
+    sample_weights: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """Compute scalar phase-4 loss for fixed sampled batch."""
-    return tdvp_residual_loss(ham, wf, configurations, t, return_diagnostics=False)
+    return tdvp_residual_loss(
+        ham,
+        wf,
+        configurations,
+        t,
+        return_diagnostics=False,
+        sample_weights=sample_weights,
+    )
 
 
 def _per_sample_score_grads(
@@ -168,6 +215,7 @@ def tdvp_vmc_gradient(
     t,
     *,
     return_diagnostics: bool = True,
+    sample_weights: Optional[jnp.ndarray] = None,
 ) -> Tuple[PyTree, Dict[str, Any]]:
     """Phase-5 gradient estimator: pathwise + covariance correction.
 
@@ -184,23 +232,31 @@ def tdvp_vmc_gradient(
     import flax.nnx as nnx
 
     configs = _validate_batch_configs(configurations, ham.N)
+    weights = _normalize_sample_weights(sample_weights, configs.shape[0])
 
     # 1) Pathwise gradient on fixed sample batch.
     def loss_for_grad(m):
         model_wf = _ModelWavefunctionView(m)
-        return _batch_loss_fn(ham, model_wf, configs, t)
+        return _batch_loss_fn(ham, model_wf, configs, t, sample_weights=weights)
 
     grad_pathwise = nnx.grad(loss_for_grad)(wf.model)
 
     # 2) Per-sample losses and centered ell.
-    _, loss_diag = tdvp_residual_loss(ham, wf, configs, t, return_diagnostics=True)
+    _, loss_diag = tdvp_residual_loss(
+        ham,
+        wf,
+        configs,
+        t,
+        return_diagnostics=True,
+        sample_weights=weights,
+    )
     ell = jnp.asarray(loss_diag.ell)
-    ell_mean = jnp.mean(ell)
+    ell_mean = _weighted_mean_array(ell, weights)
     ell_centered = ell - ell_mean
 
     # 3) Per-sample score gradients g_n = ∂θ log p_n.
     score_grads_batched = _per_sample_score_grads(wf, configs, t)
-    score_mean = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), score_grads_batched)
+    score_mean = _weighted_mean_tree(score_grads_batched, weights)
 
     # 4) Center score gradients leaf-wise.
     score_centered_batched = jax.tree_util.tree_map(
@@ -214,6 +270,15 @@ def tdvp_vmc_gradient(
             score_c * ell_centered.reshape(
                 (ell_centered.shape[0],) + (1,) * (score_c.ndim - 1)
             ),
+            axis=0,
+        )
+        if weights is None
+        else jnp.sum(
+            score_c
+            * ell_centered.reshape(
+                (ell_centered.shape[0],) + (1,) * (score_c.ndim - 1)
+            )
+            * weights.reshape((weights.shape[0],) + (1,) * (score_c.ndim - 1)),
             axis=0,
         ),
         score_centered_batched,
@@ -229,9 +294,9 @@ def tdvp_vmc_gradient(
     grad_norm_covariance = _tree_l2_norm(grad_cov)
     grad_norm_total = _tree_l2_norm(grad_total)
 
-    ell_var = jnp.mean(ell_centered * ell_centered)
+    ell_var = _weighted_mean_array(ell_centered * ell_centered, weights)
     finite_loss = jnp.all(jnp.isfinite(ell)) & jnp.isfinite(
-        _batch_loss_fn(ham, wf, configs, t)
+        _batch_loss_fn(ham, wf, configs, t, sample_weights=weights)
     )
     finite_grads = (
         _tree_all_finite(grad_pathwise)
@@ -240,10 +305,10 @@ def tdvp_vmc_gradient(
     )
 
     diagnostics = GradientDiagnostics(
-        loss=_batch_loss_fn(ham, wf, configs, t),
+        loss=_batch_loss_fn(ham, wf, configs, t, sample_weights=weights),
         ell=ell,
         ell_mean=ell_mean,
-        ell_std=jnp.std(ell),
+        ell_std=jnp.sqrt(ell_var),
         grad_norm_pathwise=grad_norm_pathwise,
         grad_norm_covariance=grad_norm_covariance,
         grad_norm_total=grad_norm_total,
@@ -272,6 +337,7 @@ def tdvp_vmc_trajectory_gradient(
     wf: Wavefunction,
     all_configurations: jnp.ndarray,
     times: jnp.ndarray,
+    sample_weights: Optional[jnp.ndarray] = None,
 ) -> Tuple[PyTree, Dict[str, Any]]:
     """Compute unified TDVP gradient averaged over multiple time slices.
 
@@ -283,8 +349,19 @@ def tdvp_vmc_trajectory_gradient(
     # Split model into functional components
     graphdef, state = nnx.split(wf.model)
 
-    def compute_slice_gradient(state_val, t_val, configs):
+    if sample_weights is not None:
+        sample_weights = jnp.asarray(sample_weights, dtype=jnp.float32)
+        if sample_weights.ndim != 2:
+            raise ValueError(f"sample_weights must have shape (T, B), got {sample_weights.shape}")
+        if sample_weights.shape[:2] != all_configurations.shape[:2]:
+            raise ValueError(
+                "sample_weights shape must match all_configurations leading dimensions "
+                f"{all_configurations.shape[:2]}, got {sample_weights.shape}"
+            )
+
+    def compute_slice_gradient(state_val, t_val, configs, weights_val):
         """Compute total TDVP gradient for a single slice functionally."""
+        weights = _normalize_sample_weights(weights_val, configs.shape[0])
         
         # 1) Reconstruct model view for this slice
         m = nnx.merge(graphdef, state_val)
@@ -294,16 +371,21 @@ def tdvp_vmc_trajectory_gradient(
         def pathwise_loss(s):
             m_p = nnx.merge(graphdef, s)
             mw = _ModelWavefunctionView(m_p)
-            return _batch_loss_fn(ham, mw, configs, t_val)
+            return _batch_loss_fn(ham, mw, configs, t_val, sample_weights=weights)
 
         grad_pathwise = jax.grad(pathwise_loss)(state_val)
 
         # 3) Covariance piece for this slice
-        _, loss_diag = tdvp_residual_loss(
-            ham, model_wf, configs, t_val, return_diagnostics=True
+        slice_loss, loss_diag = tdvp_residual_loss(
+            ham,
+            model_wf,
+            configs,
+            t_val,
+            return_diagnostics=True,
+            sample_weights=weights,
         )
         ell = jnp.asarray(loss_diag.ell)
-        ell_centered = ell - jnp.mean(ell)
+        ell_centered = ell - _weighted_mean_array(ell, weights)
 
         def logp_fn(s, cfg_i):
             m_s = nnx.merge(graphdef, s)
@@ -314,28 +396,44 @@ def tdvp_vmc_trajectory_gradient(
         # Functional score gradients: (Batch, Params...)
         score_grads = jax.vmap(jax.grad(logp_fn), in_axes=(None, 0))(state_val, configs)
         
-        score_mean = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), score_grads)
+        score_mean = _weighted_mean_tree(score_grads, weights)
         score_centered = jax.tree_util.tree_map(lambda g, gm: g - gm, score_grads, score_mean)
 
         grad_cov = jax.tree_util.tree_map(
             lambda sc: jnp.mean(
                 sc * ell_centered.reshape((ell_centered.shape[0],) + (1,) * (sc.ndim - 1)),
                 axis=0,
+            )
+            if weights is None
+            else jnp.sum(
+                sc
+                * ell_centered.reshape((ell_centered.shape[0],) + (1,) * (sc.ndim - 1))
+                * weights.reshape((weights.shape[0],) + (1,) * (sc.ndim - 1)),
+                axis=0,
             ),
             score_centered,
         )
 
         grad_total = jax.tree_util.tree_map(lambda x, y: x + y, grad_pathwise, grad_cov)
-        return grad_total, loss_diag
+        return grad_total, loss_diag, slice_loss
+
+    if sample_weights is None:
+        scan_args = (
+            times,
+            all_configurations,
+            jnp.ones(all_configurations.shape[:2], dtype=jnp.float32),
+        )
+    else:
+        scan_args = (times, all_configurations, sample_weights)
 
     def trajectory_scan(unused_carry, args):
-        t_val, configs = args
-        g, d = compute_slice_gradient(state, t_val, configs)
-        return None, (g, d)
+        t_val, configs, weights_val = args
+        g, d, loss_val = compute_slice_gradient(state, t_val, configs, weights_val)
+        return None, (g, d, loss_val)
 
     # Sequential scan over time to keep memory usage constant O(Batch)
-    _, (grads_all, diags_all) = jax.lax.scan(
-        trajectory_scan, None, (times, all_configurations)
+    _, (grads_all, diags_all, losses_all) = jax.lax.scan(
+        trajectory_scan, None, scan_args
     )
 
     # Aggregate gradients and diagnostics
@@ -345,11 +443,11 @@ def tdvp_vmc_trajectory_gradient(
     grad_total = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), grads_all)
 
     diag_summary = {
-        "loss": jnp.mean(diags_all.ell),
+        "loss": jnp.mean(losses_all),
         "grad_norm_total": _tree_l2_norm(grad_total),
         "e_real_mean": jnp.mean(diags_all.e_real),
         "e_imag_mean": jnp.mean(diags_all.e_imag),
-        "ell_mean": jnp.mean(diags_all.ell),
+        "ell_mean": jnp.mean(losses_all),
     }
 
     return grad_total, diag_summary
