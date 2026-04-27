@@ -5,6 +5,43 @@ import jax
 import jax.numpy as jnp
 
 
+def xsa_output(attn_out: jnp.ndarray, v_self: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+    """Exclusive self-attention: remove the component parallel to the self value."""
+    coeff = jnp.sum(attn_out * v_self, axis=-1, keepdims=True)
+    coeff = coeff / (jnp.sum(v_self * v_self, axis=-1, keepdims=True) + eps)
+    return attn_out - coeff * v_self
+
+
+def apply_rope(x: jnp.ndarray, positions: jnp.ndarray) -> jnp.ndarray:
+    """Apply rotary position encoding to the largest even head subspace."""
+    head_dim = x.shape[-1]
+    rotary_dim = (head_dim // 2) * 2
+    if rotary_dim == 0:
+        return x
+
+    x_rot = x[..., :rotary_dim]
+    x_pass = x[..., rotary_dim:]
+    half_dim = rotary_dim // 2
+    inv_freq = 1.0 / (
+        10000.0 ** (jnp.arange(half_dim, dtype=x.dtype) / jnp.asarray(half_dim, dtype=x.dtype))
+    )
+    angles = positions.astype(x.dtype)[..., None] * inv_freq
+
+    while angles.ndim < x_rot.ndim - 1:
+        angles = angles[..., None, :]
+
+    cos = jnp.cos(angles)
+    sin = jnp.sin(angles)
+    x_pair = x_rot.reshape(*x_rot.shape[:-1], half_dim, 2)
+    x_even = x_pair[..., 0]
+    x_odd = x_pair[..., 1]
+    rotated = jnp.stack(
+        (x_even * cos - x_odd * sin, x_even * sin + x_odd * cos),
+        axis=-1,
+    ).reshape(x_rot.shape)
+    return jnp.concatenate([rotated, x_pass], axis=-1)
+
+
 class Wavefunction(ABC):
     """Abstract base class for variational wavefunctions."""
 
@@ -24,11 +61,15 @@ class Encoder(nn.Module):
 
     def __init__(self, seq_dim, embed_dim, rngs: nn.Rngs):
         self.spin_embeds = nn.Param(jax.random.normal(rngs(), (1, embed_dim)))
-        self.pos_embeds = nn.Embed(seq_dim, embed_dim, rngs=rngs)
-        # Time MLP: (1, D) -> GeLU -> (D, D) -> GeLU
-        self.time_mlp1 = nn.Linear(1, embed_dim, rngs=rngs)
-        self.time_mlp2 = nn.Linear(embed_dim, embed_dim, rngs=rngs)
+        self.time_mlp1 = nn.Linear(1, embed_dim, rngs=rngs, use_bias=False)
+        self.time_mlp2 = nn.Linear(embed_dim, embed_dim, rngs=rngs, use_bias=False)
         self.seq_dim = seq_dim
+
+    def _time_gate(self, t, batch_dim: int) -> jnp.ndarray:
+        t_val = jnp.full((batch_dim, 1), t)
+        t_feat = jnp.tanh(self.time_mlp1(t_val))
+        t_feat = jnp.tanh(self.time_mlp2(t_feat))
+        return 1.0 + t_feat
 
     def __call__(self, configuration: jnp.ndarray, t):
         configuration = configuration.astype(jnp.int32)
@@ -43,26 +84,11 @@ class Encoder(nn.Module):
 
         batch_dim = configuration.shape[0]
 
-        # Time feature vector: (B, 1) -> (B, D)
-        t_val = jnp.full((batch_dim, 1), t)
-        t_feat = nn.gelu(self.time_mlp1(t_val))
-        t_feat = nn.gelu(self.time_mlp2(t_feat))
-        
-        # Reshape for broadcasting: (B, 1, D)
-        t_feat = t_feat[:, jnp.newaxis, :]
-
-        positions = jnp.arange(self.seq_dim)[jnp.newaxis, :].repeat(
-            configuration.shape[0], axis=0
-        )
-
         spins = 1.0 - 2.0 * configuration
         token_features = spins[:, :, jnp.newaxis] * self.spin_embeds.get_value()
 
-        x = token_features + self.pos_embeds(positions)
-        # Additive time feature
-        x = x + t_feat
-
-        return x
+        time_gate = self._time_gate(t, batch_dim)[:, jnp.newaxis, :]
+        return token_features * time_gate
 
 
 class TransformerLayer(nn.Module):
@@ -101,16 +127,21 @@ class TransformerLayer(nn.Module):
             kernel_init=nn.initializers.kaiming_normal(),
         )
 
-    def __call__(self, x: jnp.ndarray):
+    def __call__(self, x: jnp.ndarray, positions: jnp.ndarray | None = None):
         batch, seq, _ = x.shape
         q = self.q_proj(x).reshape(batch, seq, self.num_heads, self.head_dim)
         k = self.k_proj(x).reshape(batch, seq, self.num_heads, self.head_dim)
         v = self.v_proj(x).reshape(batch, seq, self.num_heads, self.head_dim)
+        if positions is None:
+            positions = jnp.arange(seq)
+        q = apply_rope(q, positions)
+        k = apply_rope(k, positions)
 
         attn_logits = jnp.einsum("bqhd,bkhd->bhqk", q, k)
         attn_logits = attn_logits / jnp.sqrt(self.head_dim)
         attn_weights = nn.softmax(attn_logits, axis=-1)
         attn = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v)
+        attn = xsa_output(attn, v)
         attn = attn.reshape(batch, seq, -1)
 
         out = self.out_proj(attn)
@@ -124,14 +155,15 @@ class BoxLayer(nn.Module):
         self.feature_dim = feature_dim
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.layernorm = nn.LayerNorm(self.feature_dim, rngs=rngs)
-        self.layernorm2 = nn.LayerNorm(self.feature_dim, rngs=rngs)
+        self.layernorm = nn.LayerNorm(self.feature_dim, rngs=rngs, use_bias=False)
+        self.layernorm2 = nn.LayerNorm(self.feature_dim, rngs=rngs, use_bias=False)
         self.transformer = TransformerLayer(
             self.feature_dim, self.num_heads, self.head_dim, self.feature_dim, rngs
         )
         self.ffn = nn.Linear(
             self.feature_dim,
             self.feature_dim,
+            use_bias=False,
             kernel_init=nn.initializers.kaiming_normal(),
             rngs=rngs,
         )
@@ -177,6 +209,7 @@ class tNQS(nn.Module):
         self.log_amp_head = nn.Linear(
             self.emb_dim,
             self.head_hidden_dim,
+            use_bias=False,
             rngs=rngs,
             kernel_init=nn.initializers.kaiming_normal(),
         )
@@ -205,9 +238,10 @@ class tNQS(nn.Module):
         x = self.encoder(configuration, t)
         for layer in self.layers:
             x = layer(x)
-        x = jnp.mean(x, axis=1)
-        x1 = self.log_amp_out(nn.tanh(self.log_amp_head(x)))
-        x2 = jnp.pi * jax.nn.soft_sign(self.phase_out(nn.tanh(self.phase_head(x))))
+        amp_features = jnp.mean(x * x, axis=1)
+        phase_features = jnp.mean(x, axis=1)
+        x1 = self.log_amp_out(nn.tanh(self.log_amp_head(amp_features)))
+        x2 = jnp.pi * jax.nn.soft_sign(self.phase_out(nn.tanh(self.phase_head(phase_features))))
         return x1, x2
 
 
@@ -254,8 +288,15 @@ class SimpleEncoder(nn.Module):
 
     def __init__(self, seq_dim, embed_dim, rngs: nn.Rngs):
         self.spin_embeds = nn.Param(jax.random.normal(rngs(), (1, embed_dim)))
-        self.pos_embeds = nn.Embed(seq_dim, embed_dim, rngs=rngs)
+        self.time_mlp1 = nn.Linear(1, embed_dim, rngs=rngs, use_bias=False)
+        self.time_mlp2 = nn.Linear(embed_dim, embed_dim, rngs=rngs, use_bias=False)
         self.seq_dim = seq_dim
+
+    def _time_gate(self, t, batch_dim: int) -> jnp.ndarray:
+        t_val = jnp.full((batch_dim, 1), t)
+        t_feat = jnp.tanh(self.time_mlp1(t_val))
+        t_feat = jnp.tanh(self.time_mlp2(t_feat))
+        return 1.0 + t_feat
 
     def __call__(self, configuration: jnp.ndarray, t):
         configuration = configuration.astype(jnp.int32)
@@ -270,20 +311,11 @@ class SimpleEncoder(nn.Module):
 
         batch_dim = configuration.shape[0]
 
-        positions = jnp.arange(self.seq_dim)[jnp.newaxis, :].repeat(
-            configuration.shape[0], axis=0
-        )
-
         spins = 1.0 - 2.0 * configuration
         token_features = spins[:, :, jnp.newaxis] * self.spin_embeds.get_value()
 
-        x = token_features + self.pos_embeds(positions)
-
-        # append the time to embedding vector
-        t = jnp.full((batch_dim, self.seq_dim, 1), t)
-        x = jnp.concatenate([x, t], axis=2)
-
-        return x
+        time_gate = self._time_gate(t, batch_dim)[:, jnp.newaxis, :]
+        return token_features * time_gate
 
 
 class SimpleTNQS(nn.Module):
@@ -305,7 +337,6 @@ class SimpleTNQS(nn.Module):
         self.head_dim = head_dim
 
         self.encoder = SimpleEncoder(self.N, emb_dim, rngs=rngs)
-        self.emb_dim += 1
 
         self.layers = nn.data([])
 
@@ -318,6 +349,7 @@ class SimpleTNQS(nn.Module):
         self.log_amp_head = nn.Linear(
             self.emb_dim,
             self.head_hidden_dim,
+            use_bias=False,
             rngs=rngs,
             kernel_init=nn.initializers.kaiming_normal(),
         )
@@ -346,9 +378,10 @@ class SimpleTNQS(nn.Module):
         x = self.encoder(configuration, t)
         for layer in self.layers:
             x = layer(x)
-        x = jnp.mean(x, axis=1)
-        x1 = self.log_amp_out(nn.tanh(self.log_amp_head(x)))
-        x2 = jnp.pi * jax.nn.soft_sign(self.phase_out(nn.tanh(self.phase_head(x))))
+        amp_features = jnp.mean(x * x, axis=1)
+        phase_features = jnp.mean(x, axis=1)
+        x1 = self.log_amp_out(nn.tanh(self.log_amp_head(amp_features)))
+        x2 = jnp.pi * jax.nn.soft_sign(self.phase_out(nn.tanh(self.phase_head(phase_features))))
         return x1, x2
 
 
@@ -407,6 +440,8 @@ class CausalTransformerLayer(nn.Module):
         v = self.v_proj(x).reshape(batch, seq, self.num_heads, self.head_dim)
 
         if cache is not None:
+            q = apply_rope(q, jnp.full((seq,), t_index))
+            k = apply_rope(k, jnp.full((seq,), t_index))
             k_cache, v_cache = cache
             k_cache = jax.lax.dynamic_update_slice_in_dim(k_cache, k, t_index, axis=1)
             v_cache = jax.lax.dynamic_update_slice_in_dim(v_cache, v, t_index, axis=1)
@@ -420,16 +455,21 @@ class CausalTransformerLayer(nn.Module):
             
             attn_weights = jax.nn.softmax(attn_logits, axis=-1)
             attn = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v_cache)
+            attn = xsa_output(attn, v)
             attn = attn.reshape(batch, seq, -1)
             out = self.out_proj(attn)
             return out, new_cache
         else:
+            positions = jnp.arange(seq)
+            q = apply_rope(q, positions)
+            k = apply_rope(k, positions)
             attn_logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) / jnp.sqrt(self.head_dim)
             mask = jnp.tril(jnp.ones((seq, seq)))[None, None, :, :]
             attn_logits = jnp.where(mask == 1, attn_logits, -1e9)
             
             attn_weights = jax.nn.softmax(attn_logits, axis=-1)
             attn = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v)
+            attn = xsa_output(attn, v)
             attn = attn.reshape(batch, seq, -1)
             out = self.out_proj(attn)
             return out, None
@@ -438,14 +478,15 @@ class CausalTransformerLayer(nn.Module):
 class CausalBoxLayer(nn.Module):
     def __init__(self, feature_dim, num_heads, head_dim, rngs: nn.Rngs):
         self.feature_dim = feature_dim
-        self.layernorm = nn.LayerNorm(self.feature_dim, rngs=rngs)
-        self.layernorm2 = nn.LayerNorm(self.feature_dim, rngs=rngs)
+        self.layernorm = nn.LayerNorm(self.feature_dim, rngs=rngs, use_bias=False)
+        self.layernorm2 = nn.LayerNorm(self.feature_dim, rngs=rngs, use_bias=False)
         self.transformer = CausalTransformerLayer(
             self.feature_dim, num_heads, head_dim, self.feature_dim, rngs
         )
         self.ffn = nn.Linear(
             self.feature_dim,
             self.feature_dim,
+            use_bias=False,
             kernel_init=nn.initializers.kaiming_normal(),
             rngs=rngs,
         )
@@ -462,25 +503,29 @@ class AutoregressiveAmpModel(nn.Module):
     def __init__(self, N, Num_boxes, emb_dim, num_heads, head_dim, rngs: nn.Rngs):
         self.N = N
         self.emb_dim = emb_dim
-        self.spin_embeds = nn.Embed(3, emb_dim, rngs=rngs) # 0, 1, 2=SOS
-        self.pos_embeds = nn.Embed(N, emb_dim, rngs=rngs)
+        self.spin_embeds = nn.Param(jax.random.normal(rngs(), (1, emb_dim)))
         
-        self.time_mlp1 = nn.Linear(1, emb_dim, rngs=rngs)
-        self.time_mlp2 = nn.Linear(emb_dim, emb_dim, rngs=rngs)
-        self.time_mlp3 = nn.Linear(emb_dim, emb_dim, rngs=rngs)
+        self.time_mlp1 = nn.Linear(1, emb_dim, rngs=rngs, use_bias=False)
+        self.time_mlp2 = nn.Linear(emb_dim, emb_dim, rngs=rngs, use_bias=False)
+        self.time_mlp3 = nn.Linear(emb_dim, emb_dim, rngs=rngs, use_bias=False)
         
         self.layers = nn.data([])
         for _ in range(Num_boxes):
             self.layers.append(CausalBoxLayer(emb_dim, num_heads, head_dim, rngs=rngs))
             
-        self.logits_out = nn.Linear(emb_dim, 2, rngs=rngs)
+        self.logits_score = nn.Linear(emb_dim, 1, rngs=rngs, use_bias=False)
 
-    def _time_features(self, t, batch_dim: int) -> jnp.ndarray:
+    def _time_gate(self, t, batch_dim: int) -> jnp.ndarray:
         t_val = jnp.full((batch_dim, 1), t)
-        t_hidden = jax.nn.gelu(self.time_mlp1(t_val))
-        t_feat = jax.nn.gelu(self.time_mlp2(t_hidden))
-        t_feat = jax.nn.gelu(self.time_mlp3(t_feat))
-        return t_feat + t_hidden
+        t_feat = jnp.tanh(self.time_mlp1(t_val))
+        t_feat = jnp.tanh(self.time_mlp2(t_feat))
+        t_feat = jnp.tanh(self.time_mlp3(t_feat))
+        return 1.0 + t_feat
+
+    def _token_features(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        spins = 1.0 - 2.0 * inputs
+        token_features = spins[:, :, jnp.newaxis] * self.spin_embeds.get_value()
+        return jnp.where(inputs[:, :, jnp.newaxis] == 2, 0.0, token_features)
 
     def __call__(self, configuration: jnp.ndarray, t: jnp.float32, cache=None, t_index=None):
         configuration = jnp.asarray(configuration)
@@ -489,15 +534,12 @@ class AutoregressiveAmpModel(nn.Module):
         if cache is None:
             sos_tokens = jnp.full((batch_dim, 1), 2, dtype=jnp.int32)
             inputs = jnp.concatenate([sos_tokens, configuration[:, :-1]], axis=1)
-            positions = jnp.arange(self.N)[jnp.newaxis, :].repeat(batch_dim, axis=0)
         else:
             inputs = jnp.where(t_index == 0, jnp.full((batch_dim, 1), 2, dtype=jnp.int32), configuration)
-            positions = jnp.full((batch_dim, 1), t_index, dtype=jnp.int32)
             
-        x = self.spin_embeds(inputs) + self.pos_embeds(positions)
-        
-        t_feat = self._time_features(t, batch_dim)[:, jnp.newaxis, :]
-        x = x + t_feat
+        x = self._token_features(inputs)
+        time_gate = self._time_gate(t, batch_dim)[:, jnp.newaxis, :]
+        x = x * time_gate
         
         new_caches = []
         for i, layer in enumerate(self.layers):
@@ -506,7 +548,8 @@ class AutoregressiveAmpModel(nn.Module):
             if nc is not None:
                 new_caches.append(nc)
                 
-        logits = self.logits_out(x)
+        score = self.logits_score(x)
+        logits = jnp.concatenate([score, -score], axis=-1)
         return logits, tuple(new_caches) if cache is not None else None
 
     def init_cache(self, batch_size):

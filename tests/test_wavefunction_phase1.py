@@ -2,7 +2,13 @@ import flax.nnx as nn
 import jax.numpy as jnp
 import pytest
 
-from src.wavefunction import tSpinNQS, SimpleSpinNQS, AutoregressiveNQS
+from src.wavefunction import (
+    AutoregressiveNQS,
+    CausalTransformerLayer,
+    SimpleSpinNQS,
+    tSpinNQS,
+    xsa_output,
+)
 
 
 def _make_model(wf_class, N=6):
@@ -14,6 +20,54 @@ def _make_model(wf_class, N=6):
         head_dim=8,
         rngs=nn.Rngs(0),
     )
+
+
+def test_xsa_output_projects_out_self_value_direction():
+    attn_out = jnp.array(
+        [
+            [
+                [[2.0, 1.0, 0.0], [1.0, -1.0, 2.0]],
+                [[0.5, 2.0, -1.0], [3.0, 0.0, 1.0]],
+            ]
+        ],
+        dtype=jnp.float32,
+    )
+    v_self = jnp.array(
+        [
+            [
+                [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+                [[1.0, 1.0, 0.0], [0.0, 0.0, 4.0]],
+            ]
+        ],
+        dtype=jnp.float32,
+    )
+
+    projected = xsa_output(attn_out, v_self)
+    residual_dot = jnp.sum(projected * v_self, axis=-1)
+
+    assert projected.shape == attn_out.shape
+    assert jnp.allclose(residual_dot, 0.0, atol=1e-5)
+
+
+def test_causal_transformer_cached_xsa_path_preserves_shape():
+    layer = CausalTransformerLayer(
+        feature_dim=8,
+        num_heads=2,
+        head_dim=4,
+        out_dim=8,
+        rngs=nn.Rngs(0),
+    )
+    x = jnp.ones((3, 1, 8), dtype=jnp.float32)
+    cache = (
+        jnp.zeros((3, 5, 2, 4), dtype=jnp.float32),
+        jnp.zeros((3, 5, 2, 4), dtype=jnp.float32),
+    )
+
+    out, new_cache = layer(x, cache=cache, t_index=2)
+
+    assert out.shape == x.shape
+    assert new_cache[0].shape == cache[0].shape
+    assert new_cache[1].shape == cache[1].shape
 
 
 @pytest.mark.parametrize("wf_class", [tSpinNQS, SimpleSpinNQS, AutoregressiveNQS])
@@ -88,22 +142,89 @@ def test_outputs_are_finite_for_valid_inputs(wf_class):
     assert jnp.all(jnp.isfinite(phi))
 
 
-def test_autoregressive_time_mlp_has_residual_third_layer():
+def test_autoregressive_time_gate_is_multiplicative_tanh_path():
     wf = _make_model(AutoregressiveNQS, N=5)
     amp_model = wf.model.amp_model
 
     batch_dim = 3
     t = jnp.float32(0.25)
     t_val = jnp.full((batch_dim, 1), t)
-    t_hidden = nn.gelu(amp_model.time_mlp1(t_val))
-    expected = nn.gelu(amp_model.time_mlp3(nn.gelu(amp_model.time_mlp2(t_hidden))))
-    expected = expected + t_hidden
+    expected = jnp.tanh(amp_model.time_mlp1(t_val))
+    expected = jnp.tanh(amp_model.time_mlp2(expected))
+    expected = 1.0 + jnp.tanh(amp_model.time_mlp3(expected))
 
-    actual = amp_model._time_features(t, batch_dim)
+    actual = amp_model._time_gate(t, batch_dim)
 
     assert hasattr(amp_model, "time_mlp3")
     assert actual.shape == (batch_dim, amp_model.emb_dim)
     assert jnp.allclose(actual, expected, atol=1e-6)
+
+
+def test_autoregressive_token_features_are_spin_flip_odd_with_zero_sos():
+    wf = _make_model(AutoregressiveNQS, N=5)
+    amp_model = wf.model.amp_model
+
+    inputs = jnp.array([[0, 1, 2]], dtype=jnp.int32)
+    features = amp_model._token_features(inputs)
+
+    assert jnp.allclose(features[:, 0, :], -features[:, 1, :], atol=1e-6)
+    assert jnp.allclose(features[:, 2, :], 0.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("wf_class", [tSpinNQS, SimpleSpinNQS, AutoregressiveNQS])
+def test_log_probability_is_global_spin_flip_symmetric(wf_class):
+    wf = _make_model(wf_class, N=6)
+    configs = jnp.array(
+        [
+            [0, 1, 0, 1, 1, 0],
+            [1, 1, 0, 0, 1, 0],
+            [0, 0, 1, 1, 0, 1],
+        ],
+        dtype=jnp.int32,
+    )
+    flipped_configs = 1 - configs
+
+    logp, _ = wf(configs, t=jnp.float32(0.4))
+    flipped_logp, _ = wf(flipped_configs, t=jnp.float32(0.4))
+
+    assert jnp.allclose(logp, flipped_logp, atol=1e-5)
+
+
+def test_autoregressive_conditional_logits_swap_under_spin_flip():
+    wf = _make_model(AutoregressiveNQS, N=6)
+    amp_model = wf.model.amp_model
+    configs = jnp.array(
+        [
+            [0, 1, 0, 1, 1, 0],
+            [1, 1, 0, 0, 1, 0],
+        ],
+        dtype=jnp.int32,
+    )
+
+    logits, _ = amp_model(configs, t=jnp.float32(0.7))
+    flipped_logits, _ = amp_model(1 - configs, t=jnp.float32(0.7))
+
+    assert jnp.allclose(flipped_logits[..., 0], logits[..., 1], atol=1e-5)
+    assert jnp.allclose(flipped_logits[..., 1], logits[..., 0], atol=1e-5)
+
+
+def test_autoregressive_symmetry_preserving_layers_are_bias_free():
+    wf = _make_model(AutoregressiveNQS, N=5)
+    amp_model = wf.model.amp_model
+    layer = amp_model.layers[0]
+
+    assert layer.layernorm.bias is None
+    assert layer.layernorm2.bias is None
+    assert layer.ffn.bias is None
+    assert layer.transformer.q_proj.bias is None
+    assert layer.transformer.k_proj.bias is None
+    assert layer.transformer.v_proj.bias is None
+    assert layer.transformer.out_proj.bias is None
+    assert amp_model.time_mlp1.bias is None
+    assert amp_model.time_mlp2.bias is None
+    assert amp_model.time_mlp3.bias is None
+    assert amp_model.logits_score.bias is None
+    assert not hasattr(amp_model, "pos_embeds")
 
 
 @pytest.mark.parametrize("wf_class", [tSpinNQS, SimpleSpinNQS, AutoregressiveNQS])
