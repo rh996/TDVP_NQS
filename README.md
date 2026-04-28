@@ -7,8 +7,8 @@ The framework is designed to simulate 1D spin-chain dynamics for the **Transvers
 ## Key Features
 
 *   **Spacetime Vectorization**: Optimizes the entire time trajectory jointly. Sampling is scanned across time, and gradients are computed through a unified trajectory estimator.
-*   **Transformer-based Wavefunctions**: Time-dependent NQS models $\Psi_\theta(\sigma, t)$ using Transformer blocks with MLP-based time conditioning.
-*   **Autoregressive NQS**: Supports an autoregressive amplitude model with direct exact sampling from the learned Born distribution, avoiding MCMC burn-in for AR runs.
+*   **Transformer-based Wavefunctions**: Time-dependent NQS models $\Psi_\theta(\sigma, t)$ using Transformer blocks with MLP-based time conditioning, including original `tSpinNQS` and symmetry-preserving `tSpinNQS_Z2`.
+*   **Autoregressive NQS**: Supports original `AutoregressiveNQS` and Z2-constrained `AutoregressiveNQS_Z2` amplitude models with direct exact sampling from the learned Born distribution.
 *   **Unbiased VMC Gradients**: Implements the exact mathematical gradient derived from the Schrödinger residual, including both the pathwise autodiff term and the sampling-measure covariance correction.
 *   **Initial Condition Anchoring**: Ensures physical correctness by anchoring the $t=0$ state using a two-step process: MSE pretraining followed by a Lagrangian penalty during evolution.
 *   **Long-Range TFIM**: Includes long-range Ising interactions $J \sum_{i<j} \sigma_i^z \sigma_j^z / |i-j|^\alpha$.
@@ -80,15 +80,17 @@ This writes loss, energy, and magnetization plots plus periodic checkpoints unde
 ## Examples
 
 *   `example/train_fully_polarized_chain.py`: Standard TFIM training from a fully polarized initial chain.
+*   `example/train_mcmc_tspinnqs.py`: Explicit MCMC training example using the original `tSpinNQS`.
 *   `example/train_simple_nqs.py`: Training with the simpler NQS architecture.
-*   `example/train_autoregressive.py`: Short-range TFIM training with `AutoregressiveNQS`.
+*   `example/train_autoregressive_no_z2.py`: Short-range TFIM training with original non-Z2 `AutoregressiveNQS`.
+*   `example/train_autoregressive.py`: Short-range TFIM training with `AutoregressiveNQS_Z2`.
 *   `example/train_lrtfim.py`: Long-range TFIM training with the non-autoregressive model.
-*   `example/train_autoregressive_lrtfim.py`: Long-range TFIM training with autoregressive sampling, energy-curve measurement, and checkpoints every 200 steps.
+*   `example/train_autoregressive_lrtfim.py`: Long-range TFIM training with `AutoregressiveNQS_Z2`, energy-curve measurement, and checkpoints every 200 steps.
 *   `example/train_save_reload_measure.py`: Save, reload, resume, and measure workflow.
 
 ## Project Structure
 
-*   `src/wavefunction.py`: Transformer, simple, and autoregressive NQS definitions.
+*   `src/wavefunction.py`: Original, Z2-symmetric, simple, and autoregressive NQS definitions.
 *   `src/TDVP.py`: Main training loop, optimizer construction, checkpointing, and trajectory driver.
 *   `src/sampler.py`: Warm-started Metropolis-Hastings sampler and direct autoregressive sampler.
 *   `src/grad.py`: Unified spacetime VMC gradient estimator with optional count weighting.

@@ -22,7 +22,7 @@ from src.observables import (
     sample_and_measure_observables,
 )
 from src.TDVP import TrainingConfig, save_training_checkpoint, train_loop
-from src.wavefunction import AutoregressiveNQS
+from src.wavefunction import AutoregressiveNQS_Z2
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,7 +44,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--t-initial", type=float, default=0.0)
     parser.add_argument("--t-final", type=float, default=1.0)
     parser.add_argument("--time-steps", type=int, default=10)
-    parser.add_argument("--pretrain-steps", type=int, default=200)
+    parser.add_argument(
+        "--pretrain-steps",
+        type=int,
+        default=200,
+        help=(
+            "Number of initial-condition pretraining steps applied across all "
+            "configured time slices before TDVP evolution."
+        ),
+    )
     parser.add_argument("--pretrain-lr", type=float, default=0.005)
     parser.add_argument("--lambda-ic", type=float, default=10.0)
     parser.add_argument("--alpha", type=float, default=1.0)
@@ -105,7 +113,7 @@ def main() -> None:
     )
 
     rng = jax.random.PRNGKey(config.seed)
-    wf = AutoregressiveNQS(
+    wf = AutoregressiveNQS_Z2(
         N=config.N,
         Num_boxes=config.Num_boxes,
         emb_dim=config.emb_dim,
@@ -125,6 +133,7 @@ def main() -> None:
         f"n_samples_per_chain={config.n_samples_per_chain}, "
         f"use_unique_ar_samples={config.use_unique_ar_samples}, "
         f"pretrain_steps={config.pretrain_steps}, "
+        f"pretrain_time_slices={config.time_steps}, "
         f"lambda_ic={config.lambda_ic}"
     )
 

@@ -40,7 +40,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--t-initial", type=float, default=0.0)
     parser.add_argument("--t-final", type=float, default=1.0)
     parser.add_argument("--time-steps", type=int, default=10)
-    parser.add_argument("--pretrain-steps", type=int, default=200)
+    parser.add_argument(
+        "--pretrain-steps",
+        type=int,
+        default=200,
+        help=(
+            "Number of initial-condition pretraining steps applied across all "
+            "configured time slices before TDVP evolution."
+        ),
+    )
     parser.add_argument("--pretrain-lr", type=float, default=0.005)
     parser.add_argument("--lambda-ic", type=float, default=10.0)
     parser.add_argument(
@@ -101,6 +109,7 @@ def main() -> None:
         f"b2={config.adamw_b2}, "
         f"eps={config.adamw_eps}, "
         f"pretrain_steps={config.pretrain_steps}, "
+        f"pretrain_time_slices={config.time_steps}, "
         f"lambda_ic={config.lambda_ic}"
     )
 

@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from src.TDVP import TrainingConfig, _create_optimizer, train_loop
+from src.TDVP import TrainingConfig, _create_optimizer, _x_polarized_mse_loss, train_loop
 from src.hamiltonian import TransverseIsingHamiltonian
 from src.sampler import metropolis_hastings_trajectory
 from src.wavefunction import AutoregressiveNQS, tSpinNQS
@@ -40,6 +40,30 @@ def _make_wf_and_ham(config: TrainingConfig):
     )
     ham = TransverseIsingHamiltonian(J=config.J, h=config.h, N=config.N)
     return wf, ham
+
+
+class TimeOnlyModel(nnx.Module):
+    def __call__(self, configurations, t):
+        batch = configurations.shape[0]
+        logp = jnp.full((batch,), t, dtype=jnp.float32)
+        phi = jnp.full((batch,), 2.0 * t, dtype=jnp.float32)
+        return logp, phi
+
+
+def test_x_polarized_mse_loss_averages_over_time_grid():
+    configs = jnp.zeros((3, 4), dtype=jnp.int32)
+    times = jnp.array([0.0, 1.0, 2.0], dtype=jnp.float32)
+
+    loss = _x_polarized_mse_loss(
+        TimeOnlyModel(),
+        configs,
+        n_sites=4,
+        target_logp=0.0,
+        times=times,
+    )
+
+    expected = jnp.mean(times**2) + jnp.mean((2.0 * times) ** 2)
+    assert jnp.allclose(loss, expected)
 
 
 def test_train_loop_runs_and_records_metrics_history():

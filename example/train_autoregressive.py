@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from src.grad import _ModelWavefunctionView
 from src.observables import sample_and_measure_observables
 from src.TDVP import TrainingConfig, train_loop, save_training_checkpoint
-from src.wavefunction import AutoregressiveNQS
+from src.wavefunction import AutoregressiveNQS_Z2
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -42,7 +42,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--t-initial", type=float, default=0.0)
     parser.add_argument("--t-final", type=float, default=1.0)
     parser.add_argument("--time-steps", type=int, default=10)
-    parser.add_argument("--pretrain-steps", type=int, default=300)
+    parser.add_argument(
+        "--pretrain-steps",
+        type=int,
+        default=300,
+        help=(
+            "Number of initial-condition pretraining steps applied across all "
+            "configured time slices before TDVP evolution."
+        ),
+    )
     parser.add_argument("--pretrain-lr", type=float, default=0.005)
     parser.add_argument("--lambda-ic", type=float, default=10.0)
     parser.add_argument(
@@ -106,12 +114,13 @@ def main() -> None:
         f"b2={config.adamw_b2}, "
         f"eps={config.adamw_eps}, "
         f"pretrain_steps={config.pretrain_steps}, "
+        f"pretrain_time_slices={config.time_steps}, "
         f"lambda_ic={config.lambda_ic}"
     )
 
     import jax
     rng = jax.random.PRNGKey(config.seed)
-    wf = AutoregressiveNQS(
+    wf = AutoregressiveNQS_Z2(
         N=config.N,
         Num_boxes=config.Num_boxes,
         emb_dim=config.emb_dim,

@@ -28,7 +28,14 @@ from src.sampler import (
     metropolis_hastings_trajectory,
     autoregressive_trajectory_sample,
 )
-from src.wavefunction import AutoregressiveNQS, SimpleSpinNQS, Wavefunction, tSpinNQS
+from src.wavefunction import (
+    AutoregressiveNQS,
+    AutoregressiveNQS_Z2,
+    SimpleSpinNQS,
+    Wavefunction,
+    tSpinNQS,
+    tSpinNQS_Z2,
+)
 
 
 @dataclass
@@ -150,10 +157,16 @@ def _x_polarized_mse_loss(
     configurations: jnp.ndarray,
     n_sites: int,
     target_logp: float,
+    times: jnp.ndarray | float = 0.0,
 ) -> jnp.ndarray:
     """MSE loss against X-polarized state: logp = target, phase = 0."""
     wf_view = _ModelWavefunctionView(model)
-    logp, phi = wf_view(configurations, t=0.0)
+    times = jnp.asarray(times, dtype=jnp.float32)
+
+    if times.ndim == 0:
+        logp, phi = wf_view(configurations, t=times)
+    else:
+        logp, phi = jax.vmap(lambda t: wf_view(configurations, t))(times)
 
     target_phi = 0.0
 
@@ -311,8 +324,10 @@ def load_training_checkpoint(filepath: str) -> Dict[str, Any]:
     wavefunction_type = payload.get("wavefunction_type", "tSpinNQS")
     wavefunction_cls = {
         "tSpinNQS": tSpinNQS,
+        "tSpinNQS_Z2": tSpinNQS_Z2,
         "SimpleSpinNQS": SimpleSpinNQS,
         "AutoregressiveNQS": AutoregressiveNQS,
+        "AutoregressiveNQS_Z2": AutoregressiveNQS_Z2,
     }.get(wavefunction_type)
     if wavefunction_cls is None:
         raise ValueError(f"Unsupported wavefunction_type in checkpoint: {wavefunction_type}")
@@ -448,6 +463,8 @@ def train_loop(
     else:
         opt_state = initial_opt_state
 
+    times = jnp.linspace(config.t_initial, config.t_final, config.time_steps)
+
     # --- Target logp for IC anchoring (Stability improvement) ---
     ic_target_logp = 0.0
     if config.pretrain_steps > 0 or config.lambda_ic > 0.0:
@@ -475,7 +492,8 @@ def train_loop(
     if config.pretrain_steps > 0:
         if verbose:
             print(
-                f"\n=== Pretraining initial condition (X-polarized) for {config.pretrain_steps} steps ==="
+                "\n=== Pretraining initial condition (X-polarized) "
+                f"across {config.time_steps} time slices for {config.pretrain_steps} steps ==="
             )
 
         pretrain_optimizer = optax.adam(config.pretrain_lr)
@@ -487,7 +505,13 @@ def train_loop(
             configs = jax.random.randint(keys, (config.batch_size, config.N), 0, 2)
 
             def loss_fn(m):
-                return _x_polarized_mse_loss(m, configs, config.N, ic_target_logp)
+                return _x_polarized_mse_loss(
+                    m,
+                    configs,
+                    config.N,
+                    ic_target_logp,
+                    times,
+                )
 
             loss, grad = nnx.value_and_grad(loss_fn)(model)
 
@@ -508,10 +532,7 @@ def train_loop(
                     f"  Pretrain step {i + 1}/{config.pretrain_steps}: MSE loss = {float(loss_val):.6f}"
                 )
 
-    # 3) Time schedule.
-    times = jnp.linspace(config.t_initial, config.t_final, config.time_steps)
-
-    # 4) Metrics tracking.
+    # 3) Metrics tracking.
     metrics_history = (
         _default_metrics_history()
         if initial_metrics_history is None
