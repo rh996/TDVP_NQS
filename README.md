@@ -25,7 +25,7 @@ The current development path focuses on autoregressive wavefunctions, exact Born
 - Residual loss modes:
   - `variance`: `(A - <A>)^2 + (B - <B>)^2`
   - `schrodinger_l2`: `A^2 + B^2`
-  - `phase_speed`: `(A - <A>)^2 + B^2`
+  - `phase_speed`: `A^2 + (B - <B>)^2`
 - Optimizers: `adamw` and `muon`.
 - Optional gradient clipping.
 - Checkpoint save/reload utilities.
@@ -156,10 +156,10 @@ The local Schrodinger residual divided by the wavefunction is:
 For autoregressive training, the default `phase_speed` loss is:
 
 ```math
-L = \left\langle (A - \langle A\rangle)^2 + B^2 \right\rangle.
+L = \left\langle A^2 + (B - \langle B\rangle)^2 \right\rangle.
 ```
 
-This keeps the freedom to choose the optimal global amplitude gauge through `<A>`, while still penalizing the phase-speed residual directly through `B`.
+Autoregressive sampling parameterizes a normalized probability distribution directly, so there is no free global amplitude rescaling. The remaining gauge freedom is the global phase shift, which appears as the constant part of `B`.
 
 ## Time Sampling
 

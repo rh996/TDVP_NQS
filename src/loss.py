@@ -198,7 +198,7 @@ def tdvp_residual_loss(
       ell_n = A_n^2 + B_n^2
 
     loss_mode="phase_speed":
-      ell_n = (A_n - mean(A))^2 + B_n^2
+      ell_n = A_n^2 + (B_n - mean(B))^2
 
     L_hat = mean(ell_n)
     """
@@ -219,7 +219,7 @@ def tdvp_residual_loss(
     elif loss_mode == "schrodinger_l2":
         ell = A**2 + B**2
     else:
-        ell = (A - A_mean) ** 2 + B**2
+        ell = A**2 + (B - B_mean) ** 2
     loss = _weighted_mean(ell, weights)
 
     if not return_diagnostics:

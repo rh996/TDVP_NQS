@@ -76,7 +76,7 @@ def _expected_from_manual_formula(ham, wf, configs):
     loss = jnp.mean(ell)
     ell_l2 = A**2 + Bv**2
     loss_l2 = jnp.mean(ell_l2)
-    ell_phase_speed = (A - A_mean) ** 2 + Bv**2
+    ell_phase_speed = A**2 + (Bv - B_mean) ** 2
     loss_phase_speed = jnp.mean(ell_phase_speed)
 
     return {
