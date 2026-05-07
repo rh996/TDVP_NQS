@@ -1,105 +1,242 @@
-# TDVP Neural Quantum States (NQS)
+# TDVP Neural Quantum States
 
-This project implements a **Variational Monte Carlo (VMC)** framework for optimizing time-dependent neural quantum states using the **Time-Dependent Variational Principle (TDVP)**.
+This repository implements time-dependent neural quantum states for 1D spin-chain dynamics with the Time-Dependent Variational Principle (TDVP). The code is written in JAX and Flax NNX, with both Metropolis-Hastings VMC and direct autoregressive sampling.
 
-The framework is designed to simulate 1D spin-chain dynamics for the **Transverse-Field Ising Model (TFIM)** and **Long-Range TFIM (LRTFIM)**, using **JAX** and **Flax NNX** for hardware-accelerated, vectorized computation.
+The main target systems are:
 
-## Key Features
+- Short-range transverse-field Ising model (TFIM)
+- Long-range transverse-field Ising model (LRTFIM)
 
-*   **Spacetime Vectorization**: Optimizes the entire time trajectory jointly. Sampling is scanned across time, and gradients are computed through a unified trajectory estimator.
-*   **Transformer-based Wavefunctions**: Time-dependent NQS models $\Psi_\theta(\sigma, t)$ using Transformer blocks with MLP-based time conditioning, including original `tSpinNQS` and symmetry-preserving `tSpinNQS_Z2`.
-*   **Autoregressive NQS**: Supports original `AutoregressiveNQS` and Z2-constrained `AutoregressiveNQS_Z2` amplitude models with direct exact sampling from the learned Born distribution.
-*   **Unbiased VMC Gradients**: Implements the exact mathematical gradient derived from the Schrödinger residual, including both the pathwise autodiff term and the sampling-measure covariance correction.
-*   **Initial Condition Anchoring**: Ensures physical correctness by anchoring the $t=0$ state using a two-step process: MSE pretraining followed by a Lagrangian penalty during evolution.
-*   **Long-Range TFIM**: Includes long-range Ising interactions $J \sum_{i<j} \sigma_i^z \sigma_j^z / |i-j|^\alpha$.
-*   **Gradient Clipping**: Optional global-norm clipping through Optax for stabilizing large TDVP updates.
-*   **Optional Unique AR Batches**: Autoregressive samples can be compressed with static-shape `jnp.unique(..., size=batch_size)` and count-weighted estimators for diagnostics or future optimization.
-*   **Multi-Core Scaling**: Transparently scales across all available CPU or TPU cores (e.g., TPU v5e) using JAX SPMD `NamedSharding`.
-*   **Observables Library**: Built-in support for $\langle Z_i(t) \rangle$, $\langle X_i(t) \rangle$, and sampled energy curves $\langle H(t) \rangle$.
+The current development path focuses on autoregressive wavefunctions, exact Born-rule sampling, symmetry-aware architectures, and stable spacetime training losses.
+
+## Main Features
+
+- `tSpinNQS`: original time-dependent transformer NQS for MCMC training.
+- `tSpinNQS_Z2`: Z2-symmetric transformer NQS.
+- `AutoregressiveNQS`: non-Z2 autoregressive amplitude model plus phase network.
+- `AutoregressiveNQS_Z2`: Z2-constrained autoregressive amplitude model.
+- Direct autoregressive sampling with logical `n_chains` batching.
+- MCMC trajectory sampling for non-autoregressive models.
+- Transformer attention with XSA: exclusive self-attention projects out the self-value direction.
+- Attention residual mixer over completed residual blocks and current partial block.
+- RoPE positional encoding in symmetry-preserving attention paths.
+- Stratified random time collocation across `[t_initial, t_final]`.
+- Initial-state anchoring at `t_initial`.
+- Residual loss modes:
+  - `variance`: `(A - <A>)^2 + (B - <B>)^2`
+  - `schrodinger_l2`: `A^2 + B^2`
+  - `phase_speed`: `(A - <A>)^2 + B^2`
+- Optimizers: `adamw` and `muon`.
+- Optional gradient clipping.
+- Checkpoint save/reload utilities.
+- Observable measurement for `Z_i(t)`, `X_i(t)`, and energy curves.
+- Exact statevector export for small autoregressive systems.
 
 ## Installation
 
 ```bash
 pip install -r requirements.txt
-# For TPU support:
+```
+
+For TPU environments, install the matching JAX TPU wheel:
+
+```bash
 pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 ```
 
 ## Quick Start
 
-You can run a full TDVP training run from an initial X-polarized state using the standard TFIM example:
+### Autoregressive TFIM with Z2 Symmetry
+
+This is the default autoregressive example. It now defaults to `muon` and `phase_speed`.
 
 ```bash
-python example/train_fully_polarized_chain.py \
-    --n-sites 8 \
-    --optimizer-name adamw \
-    --n-steps 500 \
-    --time-steps 10 \
-    --t-initial 0.0 \
-    --t-final 1.0 \
-    --n-chains 8 \
-    --n-samples-per-chain 1000 \
-    --thinning 10 \
-    --pretrain-steps 100 \
-    --lambda-ic 10.0
+python example/train_autoregressive.py \
+  --n-sites 8 \
+  --n-steps 500 \
+  --n-chains 8 \
+  --n-samples-per-chain 1000 \
+  --time-steps 10 \
+  --t-initial 0.0 \
+  --t-final 1.0 \
+  --pretrain-steps 100 \
+  --lambda-ic 10.0 \
+  --gradient-clip-norm 1.0
 ```
 
-For autoregressive training on the long-range TFIM:
+### Autoregressive TFIM Without Z2
+
+```bash
+python example/train_autoregressive_no_z2.py \
+  --n-sites 8 \
+  --n-steps 500 \
+  --n-chains 8 \
+  --n-samples-per-chain 1000 \
+  --time-steps 10 \
+  --pretrain-steps 100 \
+  --lambda-ic 10.0
+```
+
+### Autoregressive Long-Range TFIM
 
 ```bash
 python example/train_autoregressive_lrtfim.py \
-    --n-sites 8 \
-    --alpha 1.2 \
-    --optimizer-name adamw \
-    --learning-rate 0.001 \
-    --gradient-clip-norm 1.0 \
-    --n-steps 500 \
-    --time-steps 10 \
-    --t-initial 0.0 \
-    --t-final 1.0 \
-    --n-chains 8 \
-    --n-samples-per-chain 1000 \
-    --pretrain-steps 100 \
-    --lambda-ic 10.0
+  --n-sites 8 \
+  --alpha 1.2 \
+  --n-steps 500 \
+  --n-chains 8 \
+  --n-samples-per-chain 1000 \
+  --time-steps 10 \
+  --pretrain-steps 100 \
+  --lambda-ic 10.0
 ```
 
-This writes loss, energy, and magnetization plots plus periodic checkpoints under the output directory.
+This example writes loss, energy, magnetization plots, and checkpoints every 200 steps.
 
-### Common Arguments:
-*   `--n-sites`: Number of spins in the chain.
-*   `--optimizer-name`: Choice of `adamw` or `muon`.
-*   `--time-steps`: Number of joint time slices in the optimization window.
-*   `--n-chains`: Number of parallel MCMC chains, or the logical chain axis for autoregressive batches.
-*   `--n-samples-per-chain`: Samples per chain/logical chain at each time slice.
-*   `--gradient-clip-norm`: Optional global gradient clipping threshold.
-*   `--use-unique-ar-samples`: Optional count-weighted unique-sample path for autoregressive sampling.
-*   `--alpha`: Long-range TFIM decay exponent for LRTFIM examples.
-*   `--pretrain-steps`: Number of steps to anchor the $t=0$ state before evolution.
-*   `--lambda-ic`: Strength of the Lagrangian penalty for the initial condition.
+### MCMC tSpinNQS Example
+
+```bash
+python example/train_mcmc_tspinnqs.py \
+  --n-sites 8 \
+  --n-steps 500 \
+  --n-chains 32 \
+  --n-samples-per-chain 100 \
+  --time-steps 10
+```
+
+## Important Arguments
+
+- `--optimizer-name`: `muon` or `adamw`. Autoregressive examples default to `muon`.
+- `--residual-loss-mode`: `phase_speed`, `schrodinger_l2`, or `variance`. Autoregressive examples default to `phase_speed`.
+- `--n-sites`: number of spins.
+- `--n-steps`: TDVP optimization steps.
+- `--time-steps`: number of time collocation points per training step.
+- `--fixed-time-grid`: disables random time collocation and uses the fixed grid.
+- `--n-chains`: parallel chains for MCMC, or logical AR batch groups.
+- `--n-samples-per-chain`: samples per chain/logical chain per time slice.
+- `--pretrain-steps`: initial-state pretraining steps at `t_initial`.
+- `--lambda-ic`: initial-condition anchor strength during TDVP training.
+- `--gradient-clip-norm`: optional global gradient clipping threshold.
+- `--use-unique-ar-samples`: compress AR samples with static-shape unique counts.
+- `--save-statevector-max-sites`: maximum system size for exhaustive `psi(x,t)` export.
+- `--alpha`: long-range power-law exponent for LRTFIM examples.
+
+## Loss Notation
+
+The wavefunction is represented as:
+
+```math
+\psi_\theta(x,t) = \exp\left[\frac{1}{2}\log p_\theta(x,t) + i\phi_\theta(x,t)\right].
+```
+
+The local energy is:
+
+```math
+E_\mathrm{loc}(x,t) = \frac{(H\psi_\theta)(x,t)}{\psi_\theta(x,t)}
+= E_R(x,t) + iE_I(x,t).
+```
+
+The residual components used by the code are:
+
+```math
+A = \frac{1}{2}\partial_t \log p_\theta - E_I
+```
+
+```math
+B = \partial_t \phi_\theta + E_R
+```
+
+The local Schrodinger residual divided by the wavefunction is:
+
+```math
+\frac{i\partial_t\psi_\theta - H\psi_\theta}{\psi_\theta}
+= -B + iA.
+```
+
+For autoregressive training, the default `phase_speed` loss is:
+
+```math
+L = \left\langle (A - \langle A\rangle)^2 + B^2 \right\rangle.
+```
+
+This keeps the freedom to choose the optimal global amplitude gauge through `<A>`, while still penalizing the phase-speed residual directly through `B`.
+
+## Time Sampling
+
+When `random_time_collocation=True`, each training step uses stratified random time samples:
+
+- `t_initial` is always included for the anchor.
+- The remaining `time_steps - 1` points are sampled one per interval across `[t_initial, t_final]`.
+
+For example, with `time_steps=5` and `[0, 1]`, the sampled times are:
+
+```text
+[0.0, sample in [0.00, 0.25), sample in [0.25, 0.50), sample in [0.50, 0.75), sample in [0.75, 1.00)]
+```
+
+Use `--fixed-time-grid` to train only on the deterministic grid.
 
 ## Examples
 
-*   `example/train_fully_polarized_chain.py`: Standard TFIM training from a fully polarized initial chain.
-*   `example/train_mcmc_tspinnqs.py`: Explicit MCMC training example using the original `tSpinNQS`.
-*   `example/train_simple_nqs.py`: Training with the simpler NQS architecture.
-*   `example/train_autoregressive_no_z2.py`: Short-range TFIM training with original non-Z2 `AutoregressiveNQS`.
-*   `example/train_autoregressive.py`: Short-range TFIM training with `AutoregressiveNQS_Z2`.
-*   `example/train_lrtfim.py`: Long-range TFIM training with the non-autoregressive model.
-*   `example/train_autoregressive_lrtfim.py`: Long-range TFIM training with `AutoregressiveNQS_Z2`, energy-curve measurement, and checkpoints every 200 steps.
-*   `example/train_save_reload_measure.py`: Save, reload, resume, and measure workflow.
+- `example/train_autoregressive.py`: Z2 autoregressive TFIM training.
+- `example/train_autoregressive_no_z2.py`: non-Z2 autoregressive TFIM training.
+- `example/train_autoregressive_lrtfim.py`: Z2 autoregressive long-range TFIM training with energy curves and checkpoints.
+- `example/train_fully_polarized_chain.py`: MCMC TDVP from a fully polarized chain.
+- `example/train_mcmc_tspinnqs.py`: explicit MCMC example using `tSpinNQS`.
+- `example/train_simple_nqs.py`: simple NQS architecture example.
+- `example/train_lrtfim.py`: non-autoregressive long-range TFIM example.
+- `example/train_save_reload_measure.py`: checkpoint, reload, resume, and measure workflow.
 
-## Project Structure
+## Project Layout
 
-*   `src/wavefunction.py`: Original, Z2-symmetric, simple, and autoregressive NQS definitions.
-*   `src/TDVP.py`: Main training loop, optimizer construction, checkpointing, and trajectory driver.
-*   `src/sampler.py`: Warm-started Metropolis-Hastings sampler and direct autoregressive sampler.
-*   `src/grad.py`: Unified spacetime VMC gradient estimator with optional count weighting.
-*   `src/loss.py`: Schrödinger residual loss and weighted batch loss support.
-*   `src/hamiltonian.py`: Short-range TFIM and long-range TFIM local-energy implementations.
-*   `src/observables.py`: Monte Carlo and exact observables, plus sampled energy curves.
+- `src/wavefunction.py`: wavefunction architectures, XSA, RoPE, attention residuals, AR models.
+- `src/TDVP.py`: training loop, optimizers, checkpointing, stratified time sampling.
+- `src/sampler.py`: Metropolis-Hastings and autoregressive trajectory samplers.
+- `src/grad.py`: spacetime VMC gradient estimators with optional count weighting.
+- `src/loss.py`: residual components `A`, `B`, and loss modes.
+- `src/hamiltonian.py`: short-range and long-range TFIM Hamiltonians.
+- `src/observables.py`: observables, statevector utilities, and energy curves.
+- `tests/`: unit tests for wavefunctions, Hamiltonians, samplers, losses, gradients, TDVP, checkpoints, and observables.
+
+## Outputs
+
+Examples typically write to `example/outputs/...` unless `--output-dir` is provided. Depending on the script, outputs include:
+
+- `loss.png`
+- `z_trajectory.png`
+- `x_trajectory.png`
+- `energy_curve.png`
+- `final_wavefunction.pkl`
+- `final_psi_xt.npz` for small systems
+- periodic checkpoints under `checkpoints/`
+
+## Testing
+
+Run the focused test suite:
+
+```bash
+pytest tests/test_wavefunction_phase1.py \
+  tests/test_loss_phase4.py \
+  tests/test_grad_phase5.py \
+  tests/test_tdvp_phase6.py -q
+```
+
+Run all tests:
+
+```bash
+pytest -q
+```
+
+## Additional Notes
+
+- AR sampler acceptance is reported as `1.0` because AR sampling is direct, not a Metropolis accept/reject process.
+- For AR examples, total sample count is `n_chains * n_samples_per_chain`.
+- For small `N`, saved `final_psi_xt.npz` can be loaded to inspect the learned wavefunction exactly over the computational basis.
+- Large `N` exact statevector export is disabled by `--save-statevector-max-sites`.
 
 ## Documentation
 
-*   **[math.md](math.md)**: Detailed mathematical derivation of the loss function and VMC gradient estimator.
-*   **[Program.md](Program.md)**: Project roadmap and current implementation status.
-*   **[history.md](history.md)**: Chronological log of architectural changes and optimizations.
+- [math.md](math.md): mathematical derivation of residual losses and VMC gradients.
+- [Batch Autoregressive Sampling.md](Batch%20Autoregressive%20Sampling.md): autoregressive sampling notes.
+- [Program.md](Program.md): roadmap and implementation status.
+- [history.md](history.md): chronological development notes.
