@@ -19,6 +19,86 @@ def odd_silu(x: jnp.ndarray) -> jnp.ndarray:
     return x * jax.nn.sigmoid(jnp.abs(x))
 
 
+def rms_norm(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+    """Parameter-free RMS normalization for attention over residual streams."""
+    return x / jnp.sqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+
+
+class AttentionResiduals(nn.Module):
+    """Attention over completed residual blocks and the current partial block."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        feature_dim: int,
+        rngs: nn.Rngs,
+        use_even_logits: bool = False,
+    ):
+        self.num_layers = num_layers
+        self.feature_dim = feature_dim
+        self.use_even_logits = use_even_logits
+        self.w = nn.Param(
+            0.02 * jax.random.normal(rngs(), (num_layers + 1, feature_dim))
+        )
+
+    def __call__(
+        self,
+        blocks: list[jnp.ndarray],
+        partial_block: jnp.ndarray,
+        layer_index: int,
+    ) -> jnp.ndarray:
+        V = jnp.stack(tuple(blocks + [partial_block]), axis=0)
+        K = rms_norm(V)
+        if self.use_even_logits:
+            K = jnp.abs(K)
+        logits = jnp.einsum("d,nbtd->nbt", self.w.get_value()[layer_index], K)
+        alpha = nn.softmax(logits, axis=0)
+        return jnp.einsum("nbt,nbtd->btd", alpha, V)
+
+
+def attention_residual_output(
+    residuals: AttentionResiduals, blocks: list[jnp.ndarray], partial: jnp.ndarray
+) -> jnp.ndarray:
+    """Final hidden state after the last residual-attention layer."""
+    return residuals(blocks, partial, residuals.num_layers)
+
+
+class TimeFeatureMap(nn.Module):
+    """Fourier time features plus a learnable exponential quench feature."""
+
+    def __init__(
+        self,
+        num_fourier_bands: int = 4,
+        use_exp_decay: bool = True,
+        rngs: nn.Rngs | None = None,
+    ):
+        if num_fourier_bands < 0:
+            raise ValueError(f"num_fourier_bands must be >= 0, got {num_fourier_bands}")
+        self.num_fourier_bands = num_fourier_bands
+        self.use_exp_decay = use_exp_decay
+        self.output_dim = 1 + 2 * num_fourier_bands + int(use_exp_decay)
+        if use_exp_decay:
+            init_raw_a = jnp.log(jnp.expm1(jnp.asarray(1.0, dtype=jnp.float32)))
+            self.raw_decay_rate = nn.Param(init_raw_a)
+
+    def decay_rate(self) -> jnp.ndarray:
+        if not self.use_exp_decay:
+            return jnp.asarray(0.0, dtype=jnp.float32)
+        return jax.nn.softplus(self.raw_decay_rate.get_value()) + 1e-6
+
+    def __call__(self, t, batch_dim: int) -> jnp.ndarray:
+        t_val = jnp.full((batch_dim, 1), t, dtype=jnp.float32)
+        features = [t_val]
+        if self.num_fourier_bands > 0:
+            freqs = 2.0 ** jnp.arange(self.num_fourier_bands, dtype=t_val.dtype)
+            angles = 2.0 * jnp.pi * t_val * freqs[jnp.newaxis, :]
+            scale = freqs[jnp.newaxis, :]
+            features.extend([jnp.sin(angles) / scale, jnp.cos(angles) / scale])
+        if self.use_exp_decay:
+            features.append(jnp.exp(-self.decay_rate() * t_val))
+        return jnp.concatenate(features, axis=-1)
+
+
 def apply_rope(x: jnp.ndarray, positions: jnp.ndarray) -> jnp.ndarray:
     """Apply rotary position encoding to the largest even head subspace."""
     head_dim = x.shape[-1]
@@ -69,13 +149,16 @@ class Encoder(nn.Module):
 
     def __init__(self, seq_dim, embed_dim, rngs: nn.Rngs):
         self.spin_embeds = nn.Param(jax.random.normal(rngs(), (1, embed_dim)))
-        self.time_mlp1 = nn.Linear(1, embed_dim, rngs=rngs, use_bias=False)
+        self.time_features = TimeFeatureMap(rngs=rngs)
+        self.time_mlp1 = nn.Linear(
+            self.time_features.output_dim, embed_dim, rngs=rngs, use_bias=False
+        )
         self.time_mlp2 = nn.Linear(embed_dim, embed_dim, rngs=rngs, use_bias=False)
         self.seq_dim = seq_dim
 
     def _time_gate(self, t, batch_dim: int) -> jnp.ndarray:
-        t_val = jnp.full((batch_dim, 1), t)
-        t_feat = odd_silu(self.time_mlp1(t_val))
+        time_features = self.time_features(t, batch_dim)
+        t_feat = odd_silu(self.time_mlp1(time_features))
         t_feat = odd_silu(self.time_mlp2(t_feat))
         return 1.0 + t_feat
 
@@ -178,22 +261,24 @@ class BoxLayer(nn.Module):
 
     def __call__(self, x: jnp.ndarray):
         """Transformer block"""
-        x = self.layernorm(x)
-        x = x + self.transformer(x)
-        x = self.layernorm2(x)
-        x = x + odd_silu(self.ffn(x))
+        return x + self.residual_delta(x)
 
-        return x
+    def residual_delta(self, x: jnp.ndarray) -> jnp.ndarray:
+        x_norm = self.layernorm(x)
+        attn_out = self.transformer(x_norm)
+        y = x + attn_out
+        return attn_out + odd_silu(self.ffn(self.layernorm2(y)))
 
 
 class OldEncoder(nn.Module):
-    """Original encoder with additive position and time features."""
+    """Original encoder with additive position and raw-time MLP features."""
 
     def __init__(self, seq_dim, embed_dim, rngs: nn.Rngs):
         self.spin_embeds = nn.Param(jax.random.normal(rngs(), (1, embed_dim)))
         self.pos_embeds = nn.Embed(seq_dim, embed_dim, rngs=rngs)
         self.time_mlp1 = nn.Linear(1, embed_dim, rngs=rngs)
         self.time_mlp2 = nn.Linear(embed_dim, embed_dim, rngs=rngs)
+        self.time_mlp3 = nn.Linear(embed_dim, embed_dim, rngs=rngs)
         self.seq_dim = seq_dim
 
     def __call__(self, configuration: jnp.ndarray, t):
@@ -208,9 +293,10 @@ class OldEncoder(nn.Module):
             )
 
         batch_dim = configuration.shape[0]
-        t_val = jnp.full((batch_dim, 1), t)
+        t_val = jnp.full((batch_dim, 1), t, dtype=jnp.float32)
         t_feat = nn.gelu(self.time_mlp1(t_val))
-        t_feat = nn.gelu(self.time_mlp2(t_feat))[:, jnp.newaxis, :]
+        t_feat = nn.gelu(self.time_mlp2(t_feat))
+        t_feat = nn.gelu(self.time_mlp3(t_feat))[:, jnp.newaxis, :]
 
         positions = jnp.arange(self.seq_dim)[jnp.newaxis, :].repeat(batch_dim, axis=0)
         spins = 1.0 - 2.0 * configuration
@@ -289,11 +375,13 @@ class OldBoxLayer(nn.Module):
         )
 
     def __call__(self, x: jnp.ndarray):
-        x = self.layernorm(x)
-        x = x + self.transformer(x)
-        x = self.layernorm2(x)
-        x = x + nn.gelu(self.ffn(x))
-        return x
+        return x + self.residual_delta(x)
+
+    def residual_delta(self, x: jnp.ndarray) -> jnp.ndarray:
+        x_norm = self.layernorm(x)
+        attn_out = self.transformer(x_norm)
+        y = x + attn_out
+        return attn_out + nn.gelu(self.ffn(self.layernorm2(y)))
 
 
 class tNQS(nn.Module):
@@ -321,6 +409,7 @@ class tNQS(nn.Module):
             self.layers.append(
                 OldBoxLayer(self.emb_dim, self.num_heads, self.head_dim, rngs=rngs)
             )
+        self.attn_residuals = AttentionResiduals(Num_boxes, self.emb_dim, rngs=rngs)
 
         self.head_hidden_dim = self.emb_dim
         self.log_amp_head = nn.Linear(
@@ -352,8 +441,14 @@ class tNQS(nn.Module):
 
     def __call__(self, configuration: jnp.ndarray, t: jnp.float32):
         x = self.encoder(configuration, t)
-        for layer in self.layers:
-            x = layer(x)
+        blocks = [x]
+        partial = jnp.zeros_like(x)
+        for i, layer in enumerate(self.layers):
+            h = self.attn_residuals(blocks, partial, i)
+            partial = partial + layer.residual_delta(h)
+            blocks.append(partial)
+            partial = jnp.zeros_like(partial)
+        x = attention_residual_output(self.attn_residuals, blocks, partial)
         x = jnp.mean(x, axis=1)
         x1 = self.log_amp_out(nn.tanh(self.log_amp_head(x)))
         x2 = jnp.pi * jax.nn.soft_sign(self.phase_out(nn.tanh(self.phase_head(x))))
@@ -386,6 +481,9 @@ class tNQS_Z2(nn.Module):
             self.layers.append(
                 BoxLayer(self.emb_dim, self.num_heads, self.head_dim, rngs=rngs)
             )
+        self.attn_residuals = AttentionResiduals(
+            Num_boxes, self.emb_dim, rngs=rngs, use_even_logits=True
+        )
 
         self.head_hidden_dim = self.emb_dim
         self.log_amp_head = nn.Linear(
@@ -427,8 +525,14 @@ class tNQS_Z2(nn.Module):
 
     def __call__(self, configuration: jnp.ndarray, t: jnp.float32):
         x = self.encoder(configuration, t)
-        for layer in self.layers:
-            x = layer(x)
+        blocks = [x]
+        partial = jnp.zeros_like(x)
+        for i, layer in enumerate(self.layers):
+            h = self.attn_residuals(blocks, partial, i)
+            partial = partial + layer.residual_delta(h)
+            blocks.append(partial)
+            partial = jnp.zeros_like(partial)
+        x = attention_residual_output(self.attn_residuals, blocks, partial)
 
         phase_features = jnp.mean(x, axis=1)
         x1 = self._log_amp_from_features(x)
@@ -519,13 +623,16 @@ class SimpleEncoder(nn.Module):
 
     def __init__(self, seq_dim, embed_dim, rngs: nn.Rngs):
         self.spin_embeds = nn.Param(jax.random.normal(rngs(), (1, embed_dim)))
-        self.time_mlp1 = nn.Linear(1, embed_dim, rngs=rngs, use_bias=False)
+        self.time_features = TimeFeatureMap(rngs=rngs)
+        self.time_mlp1 = nn.Linear(
+            self.time_features.output_dim, embed_dim, rngs=rngs, use_bias=False
+        )
         self.time_mlp2 = nn.Linear(embed_dim, embed_dim, rngs=rngs, use_bias=False)
         self.seq_dim = seq_dim
 
     def _time_gate(self, t, batch_dim: int) -> jnp.ndarray:
-        t_val = jnp.full((batch_dim, 1), t)
-        t_feat = odd_silu(self.time_mlp1(t_val))
+        time_features = self.time_features(t, batch_dim)
+        t_feat = odd_silu(self.time_mlp1(time_features))
         t_feat = odd_silu(self.time_mlp2(t_feat))
         return 1.0 + t_feat
 
@@ -575,6 +682,9 @@ class SimpleTNQS(nn.Module):
             self.layers.append(
                 BoxLayer(self.emb_dim, self.num_heads, self.head_dim, rngs=rngs)
             )
+        self.attn_residuals = AttentionResiduals(
+            Num_boxes, self.emb_dim, rngs=rngs, use_even_logits=True
+        )
 
         self.head_hidden_dim = self.emb_dim
         self.log_amp_head = nn.Linear(
@@ -616,8 +726,14 @@ class SimpleTNQS(nn.Module):
 
     def __call__(self, configuration: jnp.ndarray, t: jnp.float32):
         x = self.encoder(configuration, t)
-        for layer in self.layers:
-            x = layer(x)
+        blocks = [x]
+        partial = jnp.zeros_like(x)
+        for i, layer in enumerate(self.layers):
+            h = self.attn_residuals(blocks, partial, i)
+            partial = partial + layer.residual_delta(h)
+            blocks.append(partial)
+            partial = jnp.zeros_like(partial)
+        x = attention_residual_output(self.attn_residuals, blocks, partial)
 
         phase_features = jnp.mean(x, axis=1)
         x1 = self._log_amp_from_features(x)
@@ -738,9 +854,14 @@ class CausalBoxLayer(nn.Module):
     def __call__(self, x: jnp.ndarray, cache=None, t_index=None):
         x_norm = self.layernorm(x)
         attn_out, new_cache = self.transformer(x_norm, cache, t_index)
-        x = x + attn_out
-        x = x + odd_silu(self.ffn(self.layernorm2(x)))
-        return x, new_cache
+        y = x + attn_out
+        return y + odd_silu(self.ffn(self.layernorm2(y))), new_cache
+
+    def residual_delta(self, x: jnp.ndarray, cache=None, t_index=None):
+        x_norm = self.layernorm(x)
+        attn_out, new_cache = self.transformer(x_norm, cache, t_index)
+        y = x + attn_out
+        return attn_out + odd_silu(self.ffn(self.layernorm2(y))), new_cache
 
 
 class OldCausalTransformerLayer(nn.Module):
@@ -804,9 +925,14 @@ class OldCausalBoxLayer(nn.Module):
     def __call__(self, x: jnp.ndarray, cache=None, t_index=None):
         x_norm = self.layernorm(x)
         attn_out, new_cache = self.transformer(x_norm, cache, t_index)
-        x = x + attn_out
-        x = x + jax.nn.gelu(self.ffn(self.layernorm2(x)))
-        return x, new_cache
+        y = x + attn_out
+        return y + jax.nn.gelu(self.ffn(self.layernorm2(y))), new_cache
+
+    def residual_delta(self, x: jnp.ndarray, cache=None, t_index=None):
+        x_norm = self.layernorm(x)
+        attn_out, new_cache = self.transformer(x_norm, cache, t_index)
+        y = x + attn_out
+        return attn_out + jax.nn.gelu(self.ffn(self.layernorm2(y))), new_cache
 
 
 class AutoregressiveAmpModel(nn.Module):
@@ -818,7 +944,8 @@ class AutoregressiveAmpModel(nn.Module):
         self.spin_embeds = nn.Embed(3, emb_dim, rngs=rngs)  # 0, 1, 2=SOS
         self.pos_embeds = nn.Embed(N, emb_dim, rngs=rngs)
 
-        self.time_mlp1 = nn.Linear(1, emb_dim, rngs=rngs)
+        self.time_features = TimeFeatureMap(rngs=rngs)
+        self.time_mlp1 = nn.Linear(self.time_features.output_dim, emb_dim, rngs=rngs)
         self.time_mlp2 = nn.Linear(emb_dim, emb_dim, rngs=rngs)
         self.time_mlp3 = nn.Linear(emb_dim, emb_dim, rngs=rngs)
 
@@ -827,12 +954,13 @@ class AutoregressiveAmpModel(nn.Module):
             self.layers.append(
                 OldCausalBoxLayer(emb_dim, num_heads, head_dim, rngs=rngs)
             )
+        self.attn_residuals = AttentionResiduals(Num_boxes, emb_dim, rngs=rngs)
 
         self.logits_out = nn.Linear(emb_dim, 2, rngs=rngs)
 
     def _time_features(self, t, batch_dim: int) -> jnp.ndarray:
-        t_val = jnp.full((batch_dim, 1), t)
-        t_hidden = jax.nn.gelu(self.time_mlp1(t_val))
+        time_features = self.time_features(t, batch_dim)
+        t_hidden = jax.nn.gelu(self.time_mlp1(time_features))
         t_feat = jax.nn.gelu(self.time_mlp2(t_hidden))
         t_feat = jax.nn.gelu(self.time_mlp3(t_feat))
         return t_feat + t_hidden
@@ -858,12 +986,19 @@ class AutoregressiveAmpModel(nn.Module):
         x = self.spin_embeds(inputs) + self.pos_embeds(positions)
         x = x + self._time_features(t, batch_dim)[:, jnp.newaxis, :]
 
+        blocks = [x]
+        partial = jnp.zeros_like(x)
         new_caches = []
         for i, layer in enumerate(self.layers):
+            h = self.attn_residuals(blocks, partial, i)
             layer_cache = cache[i] if cache is not None else None
-            x, nc = layer(x, layer_cache, t_index)
+            delta, nc = layer.residual_delta(h, layer_cache, t_index)
+            partial = partial + delta
+            blocks.append(partial)
+            partial = jnp.zeros_like(partial)
             if nc is not None:
                 new_caches.append(nc)
+        x = attention_residual_output(self.attn_residuals, blocks, partial)
 
         logits = self.logits_out(x)
         return logits, tuple(new_caches) if cache is not None else None
@@ -891,19 +1026,25 @@ class AutoregressiveAmpModel_Z2(nn.Module):
         self.emb_dim = emb_dim
         self.spin_embeds = nn.Param(jax.random.normal(rngs(), (1, emb_dim)))
 
-        self.time_mlp1 = nn.Linear(1, emb_dim, rngs=rngs, use_bias=False)
+        self.time_features = TimeFeatureMap(rngs=rngs)
+        self.time_mlp1 = nn.Linear(
+            self.time_features.output_dim, emb_dim, rngs=rngs, use_bias=False
+        )
         self.time_mlp2 = nn.Linear(emb_dim, emb_dim, rngs=rngs, use_bias=False)
         self.time_mlp3 = nn.Linear(emb_dim, emb_dim, rngs=rngs, use_bias=False)
 
         self.layers = nn.data([])
         for _ in range(Num_boxes):
             self.layers.append(CausalBoxLayer(emb_dim, num_heads, head_dim, rngs=rngs))
+        self.attn_residuals = AttentionResiduals(
+            Num_boxes, emb_dim, rngs=rngs, use_even_logits=True
+        )
 
         self.logits_score = nn.Linear(emb_dim, 1, rngs=rngs, use_bias=False)
 
     def _time_gate(self, t, batch_dim: int) -> jnp.ndarray:
-        t_val = jnp.full((batch_dim, 1), t)
-        t_feat = odd_silu(self.time_mlp1(t_val))
+        time_features = self.time_features(t, batch_dim)
+        t_feat = odd_silu(self.time_mlp1(time_features))
         t_feat = odd_silu(self.time_mlp2(t_feat))
         t_feat = odd_silu(self.time_mlp3(t_feat))
         return 1.0 + t_feat
@@ -933,12 +1074,19 @@ class AutoregressiveAmpModel_Z2(nn.Module):
         time_gate = self._time_gate(t, batch_dim)[:, jnp.newaxis, :]
         x = x * time_gate
 
+        blocks = [x]
+        partial = jnp.zeros_like(x)
         new_caches = []
         for i, layer in enumerate(self.layers):
+            h = self.attn_residuals(blocks, partial, i)
             layer_cache = cache[i] if cache is not None else None
-            x, nc = layer(x, layer_cache, t_index)
+            delta, nc = layer.residual_delta(h, layer_cache, t_index)
+            partial = partial + delta
+            blocks.append(partial)
+            partial = jnp.zeros_like(partial)
             if nc is not None:
                 new_caches.append(nc)
+        x = attention_residual_output(self.attn_residuals, blocks, partial)
 
         score = self.logits_score(x)
         logits = jnp.concatenate([score, -score], axis=-1)

@@ -33,13 +33,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-sites", type=int, default=4)
     parser.add_argument("--n-chains", type=int, default=4)
     parser.add_argument("--n-samples-per-chain", type=int, default=2500)
-    parser.add_argument("--optimizer-name", type=str, default="adamw")
+    parser.add_argument("--optimizer-name", type=str, default="muon")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--adamw-b1", type=float, default=0.9)
     parser.add_argument("--adamw-b2", type=float, default=0.999)
     parser.add_argument("--adamw-eps", type=float, default=1e-8)
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
+    parser.add_argument(
+        "--residual-loss-mode",
+        choices=("variance", "schrodinger_l2", "phase_speed"),
+        default="phase_speed",
+        help="Residual loss mode. Defaults to phase_speed for autoregressive training.",
+    )
     parser.add_argument("--use-unique-ar-samples", action="store_true")
     parser.add_argument("--t-initial", type=float, default=0.0)
     parser.add_argument("--t-final", type=float, default=1.0)
@@ -86,6 +92,7 @@ def main() -> None:
         adamw_eps=args.adamw_eps,
         weight_decay=args.weight_decay,
         gradient_clip_norm=args.gradient_clip_norm,
+        residual_loss_mode=args.residual_loss_mode,
         n_steps=args.n_steps,
         n_samples_per_chain=args.n_samples_per_chain,
         burn_in=0,
@@ -132,6 +139,7 @@ def main() -> None:
         f"n_chains={config.n_chains}, "
         f"n_samples_per_chain={config.n_samples_per_chain}, "
         f"use_unique_ar_samples={config.use_unique_ar_samples}, "
+        f"residual_loss_mode={config.residual_loss_mode}, "
         f"pretrain_steps={config.pretrain_steps}, "
         f"pretrain_time_slices={config.time_steps}, "
         f"lambda_ic={config.lambda_ic}"

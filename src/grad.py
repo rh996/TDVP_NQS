@@ -174,6 +174,7 @@ def _batch_loss_fn(
     configurations: jnp.ndarray,
     t,
     sample_weights: Optional[jnp.ndarray] = None,
+    loss_mode: str = "variance",
 ) -> jnp.ndarray:
     """Compute scalar phase-4 loss for fixed sampled batch."""
     return tdvp_residual_loss(
@@ -183,6 +184,7 @@ def _batch_loss_fn(
         t,
         return_diagnostics=False,
         sample_weights=sample_weights,
+        loss_mode=loss_mode,
     )
 
 
@@ -216,6 +218,7 @@ def tdvp_vmc_gradient(
     *,
     return_diagnostics: bool = True,
     sample_weights: Optional[jnp.ndarray] = None,
+    loss_mode: str = "variance",
 ) -> Tuple[PyTree, Dict[str, Any]]:
     """Phase-5 gradient estimator: pathwise + covariance correction.
 
@@ -237,7 +240,14 @@ def tdvp_vmc_gradient(
     # 1) Pathwise gradient on fixed sample batch.
     def loss_for_grad(m):
         model_wf = _ModelWavefunctionView(m)
-        return _batch_loss_fn(ham, model_wf, configs, t, sample_weights=weights)
+        return _batch_loss_fn(
+            ham,
+            model_wf,
+            configs,
+            t,
+            sample_weights=weights,
+            loss_mode=loss_mode,
+        )
 
     grad_pathwise = nnx.grad(loss_for_grad)(wf.model)
 
@@ -249,6 +259,7 @@ def tdvp_vmc_gradient(
         t,
         return_diagnostics=True,
         sample_weights=weights,
+        loss_mode=loss_mode,
     )
     ell = jnp.asarray(loss_diag.ell)
     ell_mean = _weighted_mean_array(ell, weights)
@@ -296,7 +307,9 @@ def tdvp_vmc_gradient(
 
     ell_var = _weighted_mean_array(ell_centered * ell_centered, weights)
     finite_loss = jnp.all(jnp.isfinite(ell)) & jnp.isfinite(
-        _batch_loss_fn(ham, wf, configs, t, sample_weights=weights)
+        _batch_loss_fn(
+            ham, wf, configs, t, sample_weights=weights, loss_mode=loss_mode
+        )
     )
     finite_grads = (
         _tree_all_finite(grad_pathwise)
@@ -305,7 +318,9 @@ def tdvp_vmc_gradient(
     )
 
     diagnostics = GradientDiagnostics(
-        loss=_batch_loss_fn(ham, wf, configs, t, sample_weights=weights),
+        loss=_batch_loss_fn(
+            ham, wf, configs, t, sample_weights=weights, loss_mode=loss_mode
+        ),
         ell=ell,
         ell_mean=ell_mean,
         ell_std=jnp.sqrt(ell_var),
@@ -338,6 +353,7 @@ def tdvp_vmc_trajectory_gradient(
     all_configurations: jnp.ndarray,
     times: jnp.ndarray,
     sample_weights: Optional[jnp.ndarray] = None,
+    loss_mode: str = "variance",
 ) -> Tuple[PyTree, Dict[str, Any]]:
     """Compute unified TDVP gradient averaged over multiple time slices.
 
@@ -371,7 +387,14 @@ def tdvp_vmc_trajectory_gradient(
         def pathwise_loss(s):
             m_p = nnx.merge(graphdef, s)
             mw = _ModelWavefunctionView(m_p)
-            return _batch_loss_fn(ham, mw, configs, t_val, sample_weights=weights)
+            return _batch_loss_fn(
+                ham,
+                mw,
+                configs,
+                t_val,
+                sample_weights=weights,
+                loss_mode=loss_mode,
+            )
 
         grad_pathwise = jax.grad(pathwise_loss)(state_val)
 
@@ -383,6 +406,7 @@ def tdvp_vmc_trajectory_gradient(
             t_val,
             return_diagnostics=True,
             sample_weights=weights,
+            loss_mode=loss_mode,
         )
         ell = jnp.asarray(loss_diag.ell)
         ell_centered = ell - _weighted_mean_array(ell, weights)

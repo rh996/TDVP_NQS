@@ -74,6 +74,10 @@ def _expected_from_manual_formula(ham, wf, configs):
     B_mean = jnp.mean(Bv)
     ell = (A - A_mean) ** 2 + (Bv - B_mean) ** 2
     loss = jnp.mean(ell)
+    ell_l2 = A**2 + Bv**2
+    loss_l2 = jnp.mean(ell_l2)
+    ell_phase_speed = (A - A_mean) ** 2 + Bv**2
+    loss_phase_speed = jnp.mean(ell_phase_speed)
 
     return {
         "A": A,
@@ -82,6 +86,10 @@ def _expected_from_manual_formula(ham, wf, configs):
         "B_mean": B_mean,
         "ell": ell,
         "loss": loss,
+        "ell_l2": ell_l2,
+        "loss_l2": loss_l2,
+        "ell_phase_speed": ell_phase_speed,
+        "loss_phase_speed": loss_phase_speed,
         "dlogp_dt": dlogp_dt,
         "dphi_dt": dphi_dt,
         "e_real": e_real,
@@ -166,6 +174,70 @@ def test_tdvp_residual_loss_matches_manual_centered_variance():
     assert jnp.allclose(diag.dphi_dt, expected["dphi_dt"], atol=1e-6)
     assert jnp.allclose(diag.e_real, expected["e_real"], atol=1e-6)
     assert jnp.allclose(diag.e_imag, expected["e_imag"], atol=1e-6)
+
+
+def test_tdvp_residual_loss_matches_manual_schrodinger_l2():
+    ham = TransverseIsingHamiltonian(J=0.9, h=1.1, N=3)
+    wf = DummyWavefunction(alpha=-0.3, beta=0.2, gamma=0.45, delta=-0.7)
+    t = jnp.float32(0.8)
+
+    configs = jnp.array(
+        [
+            [0, 1, 0],
+            [1, 1, 0],
+            [0, 0, 1],
+            [1, 0, 1],
+            [0, 1, 1],
+        ],
+        dtype=jnp.int32,
+    )
+
+    loss, diag = tdvp_residual_loss(
+        ham,
+        wf,
+        configs,
+        t,
+        return_diagnostics=True,
+        loss_mode="schrodinger_l2",
+    )
+    expected = _expected_from_manual_formula(ham, wf, configs)
+
+    assert jnp.allclose(loss, expected["loss_l2"], atol=1e-6)
+    assert jnp.allclose(diag.ell, expected["ell_l2"], atol=1e-6)
+    assert jnp.allclose(diag.A_mean, expected["A_mean"], atol=1e-6)
+    assert jnp.allclose(diag.B_mean, expected["B_mean"], atol=1e-6)
+
+
+def test_tdvp_residual_loss_matches_manual_phase_speed():
+    ham = TransverseIsingHamiltonian(J=0.9, h=1.1, N=3)
+    wf = DummyWavefunction(alpha=-0.3, beta=0.2, gamma=0.45, delta=-0.7)
+    t = jnp.float32(0.8)
+
+    configs = jnp.array(
+        [
+            [0, 1, 0],
+            [1, 1, 0],
+            [0, 0, 1],
+            [1, 0, 1],
+            [0, 1, 1],
+        ],
+        dtype=jnp.int32,
+    )
+
+    loss, diag = tdvp_residual_loss(
+        ham,
+        wf,
+        configs,
+        t,
+        return_diagnostics=True,
+        loss_mode="phase_speed",
+    )
+    expected = _expected_from_manual_formula(ham, wf, configs)
+
+    assert jnp.allclose(loss, expected["loss_phase_speed"], atol=1e-6)
+    assert jnp.allclose(diag.ell, expected["ell_phase_speed"], atol=1e-6)
+    assert jnp.allclose(diag.A_mean, expected["A_mean"], atol=1e-6)
+    assert jnp.allclose(diag.B_mean, expected["B_mean"], atol=1e-6)
 
 
 def test_weighted_tdvp_residual_loss_matches_expanded_duplicates():

@@ -4,11 +4,17 @@ import sys
 from pathlib import Path
 
 import flax.nnx as nnx
+import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import numpy as np
 
 from src.grad import _ModelWavefunctionView
-from src.observables import sample_and_measure_observables
+from src.observables import (
+    enumerate_binary_configurations,
+    normalized_statevector,
+    sample_and_measure_observables,
+)
 from src.TDVP import TrainingConfig, train_loop, save_training_checkpoint
 from src.wavefunction import AutoregressiveNQS_Z2
 
@@ -23,7 +29,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".mpl-cache"))
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train TDVP from a fully polarized spin chain with AdamW and plot the loss."
+            "Train autoregressive TDVP from a fully polarized spin chain and plot the loss."
         )
     )
     parser.add_argument("--n-steps", type=int, default=300)
@@ -37,11 +43,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adamw-eps", type=float, default=1e-8)
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
     parser.add_argument("--n-samples-per-chain", type=int, default=1000)
+    parser.add_argument(
+        "--residual-loss-mode",
+        choices=("variance", "schrodinger_l2", "phase_speed"),
+        default="phase_speed",
+    )
     parser.add_argument("--use-unique-ar-samples", action="store_true")
     parser.add_argument("--thinning", type=int, default=10)
     parser.add_argument("--t-initial", type=float, default=0.0)
     parser.add_argument("--t-final", type=float, default=1.0)
     parser.add_argument("--time-steps", type=int, default=10)
+    parser.add_argument(
+        "--fixed-time-grid",
+        action="store_true",
+        help="Disable random continuous-time collocation and train only on the fixed time grid.",
+    )
     parser.add_argument(
         "--pretrain-steps",
         type=int,
@@ -60,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         help="Site index for per-site observables.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--save-statevector-max-sites",
+        type=int,
+        default=16,
+        help="Maximum N for exhaustive psi(x,t) export.",
+    )
     parser.add_argument("--output-dir", type=Path, default=ROOT / "example" / "outputs")
     return parser.parse_args()
 
@@ -88,6 +110,7 @@ def main() -> None:
         adamw_eps=args.adamw_eps,
         weight_decay=args.weight_decay,
         gradient_clip_norm=args.gradient_clip_norm,
+        residual_loss_mode=args.residual_loss_mode,
         n_steps=args.n_steps,
         n_samples_per_chain=args.n_samples_per_chain,
         burn_in=50,
@@ -98,6 +121,7 @@ def main() -> None:
         t_initial=args.t_initial,
         t_final=args.t_final,
         time_steps=args.time_steps,
+        random_time_collocation=not args.fixed_time_grid,
         pretrain_steps=args.pretrain_steps,
         pretrain_lr=args.pretrain_lr,
         lambda_ic=args.lambda_ic,
@@ -113,12 +137,13 @@ def main() -> None:
         f"b1={config.adamw_b1}, "
         f"b2={config.adamw_b2}, "
         f"eps={config.adamw_eps}, "
+        f"residual_loss_mode={config.residual_loss_mode}, "
         f"pretrain_steps={config.pretrain_steps}, "
-        f"pretrain_time_slices={config.time_steps}, "
+        f"time_steps={config.time_steps}, "
+        f"random_time_collocation={config.random_time_collocation}, "
         f"lambda_ic={config.lambda_ic}"
     )
 
-    import jax
     rng = jax.random.PRNGKey(config.seed)
     wf = AutoregressiveNQS_Z2(
         N=config.N,
@@ -153,8 +178,6 @@ def main() -> None:
     # --- Measure and Plot Observables ---
     print(f"\nMeasuring observables for site {args.target_site}...")
     wf = result["wavefunction"]
-    import jax
-
     times = jnp.linspace(config.t_initial, config.t_final, config.time_steps)
     z_values = []
     x_values = []
@@ -176,10 +199,11 @@ def main() -> None:
             key=key,
         )
 
+    measure_rng = jax.random.PRNGKey(args.seed)
     for t_val in times:
-        rng, measure_rng = jax.random.split(jax.random.PRNGKey(args.seed))
+        measure_rng, subkey = jax.random.split(measure_rng)
         obs_est, _, obs_configs = jitted_measure(
-            wf.model, float(t_val), obs_configs, measure_rng
+            wf.model, float(t_val), obs_configs, subkey
         )
         z_values.append(float(obs_est.z_sites[args.target_site]))
         x_values.append(float(obs_est.x_sites_real[args.target_site]))
@@ -226,6 +250,31 @@ def main() -> None:
         opt_state=result["opt_state"],
     )
     print(f"Saved final wavefunction and state to {checkpoint_path}")
+
+    if config.N <= args.save_statevector_max_sites:
+        basis_configs = enumerate_binary_configurations(config.N)
+        psi_by_time = []
+        for t_val in times:
+            psi_by_time.append(normalized_statevector(result["wavefunction"], config.N, t_val))
+        psi_xt = jnp.stack(psi_by_time, axis=0)
+
+        psi_path = output_dir / "final_psi_xt.npz"
+        np.savez(
+            psi_path,
+            times=np.asarray(jax.device_get(times)),
+            configurations=np.asarray(jax.device_get(basis_configs), dtype=np.int32),
+            psi=np.asarray(jax.device_get(psi_xt)),
+            psi_real=np.asarray(jax.device_get(jnp.real(psi_xt))),
+            psi_imag=np.asarray(jax.device_get(jnp.imag(psi_xt))),
+            probability=np.asarray(jax.device_get(jnp.abs(psi_xt) ** 2)),
+        )
+        print(f"Saved normalized psi(x,t) table to {psi_path}")
+    else:
+        print(
+            "Skipped exhaustive psi(x,t) export because "
+            f"N={config.N} exceeds --save-statevector-max-sites="
+            f"{args.save_statevector_max_sites}."
+        )
 
 
 if __name__ == "__main__":

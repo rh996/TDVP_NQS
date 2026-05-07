@@ -3,7 +3,13 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from src.TDVP import TrainingConfig, _create_optimizer, _x_polarized_mse_loss, train_loop
+from src.TDVP import (
+    TrainingConfig,
+    _create_optimizer,
+    _stratified_random_train_times,
+    _x_polarized_mse_loss,
+    train_loop,
+)
 from src.hamiltonian import TransverseIsingHamiltonian
 from src.sampler import metropolis_hastings_trajectory
 from src.wavefunction import AutoregressiveNQS, tSpinNQS
@@ -64,6 +70,35 @@ def test_x_polarized_mse_loss_averages_over_time_grid():
 
     expected = jnp.mean(times**2) + jnp.mean((2.0 * times) ** 2)
     assert jnp.allclose(loss, expected)
+
+
+def test_stratified_random_train_times_sample_each_interval():
+    times = _stratified_random_train_times(
+        jax.random.PRNGKey(0),
+        t_initial=0.0,
+        t_final=1.0,
+        n_times=5,
+    )
+
+    assert times.shape == (5,)
+    assert jnp.allclose(times[0], 0.0)
+
+    edges = jnp.linspace(0.0, 1.0, 5)
+    assert jnp.all(times[1:] >= edges[:-1])
+    assert jnp.all(times[1:] < edges[1:])
+    assert jnp.all(times[1:] == jnp.sort(times[1:]))
+
+
+def test_stratified_random_train_times_single_time_is_anchor():
+    times = _stratified_random_train_times(
+        jax.random.PRNGKey(0),
+        t_initial=0.25,
+        t_final=1.0,
+        n_times=1,
+    )
+
+    assert times.shape == (1,)
+    assert jnp.allclose(times[0], 0.25)
 
 
 def test_train_loop_runs_and_records_metrics_history():

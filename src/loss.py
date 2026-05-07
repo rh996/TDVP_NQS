@@ -187,20 +187,39 @@ def tdvp_residual_loss(
     *,
     return_diagnostics: bool = True,
     sample_weights: Optional[jnp.ndarray] = None,
+    loss_mode: str = "variance",
 ):
-    """Compute Monte Carlo TDVP residual variance loss.
+    """Compute Monte Carlo TDVP residual loss.
 
-    ell_n = (A_n - mean(A))^2 + (B_n - mean(B))^2
+    loss_mode="variance":
+      ell_n = (A_n - mean(A))^2 + (B_n - mean(B))^2
+
+    loss_mode="schrodinger_l2":
+      ell_n = A_n^2 + B_n^2
+
+    loss_mode="phase_speed":
+      ell_n = (A_n - mean(A))^2 + B_n^2
+
     L_hat = mean(ell_n)
     """
     A, B, extras = tdvp_residual_components(ham, wf, configurations, t)
 
     weights = _normalize_sample_weights(sample_weights, A.shape[0])
+    if loss_mode not in ("variance", "schrodinger_l2", "phase_speed"):
+        raise ValueError(
+            "loss_mode must be one of {'variance', 'schrodinger_l2', 'phase_speed'}, "
+            f"got {loss_mode!r}"
+        )
 
     A_mean = _weighted_mean(A, weights)
     B_mean = _weighted_mean(B, weights)
 
-    ell = (A - A_mean) ** 2 + (B - B_mean) ** 2
+    if loss_mode == "variance":
+        ell = (A - A_mean) ** 2 + (B - B_mean) ** 2
+    elif loss_mode == "schrodinger_l2":
+        ell = A**2 + B**2
+    else:
+        ell = (A - A_mean) ** 2 + B**2
     loss = _weighted_mean(ell, weights)
 
     if not return_diagnostics:

@@ -3,10 +3,12 @@ import jax.numpy as jnp
 import pytest
 
 from src.wavefunction import (
+    AttentionResiduals,
     AutoregressiveNQS,
     AutoregressiveNQS_Z2,
     CausalTransformerLayer,
     SimpleSpinNQS,
+    TimeFeatureMap,
     odd_silu,
     tSpinNQS,
     tSpinNQS_Z2,
@@ -71,6 +73,33 @@ def test_causal_transformer_cached_xsa_path_preserves_shape():
     assert out.shape == x.shape
     assert new_cache[0].shape == cache[0].shape
     assert new_cache[1].shape == cache[1].shape
+
+
+def test_time_feature_map_has_fourier_and_positive_decay_features():
+    feature_map = TimeFeatureMap(num_fourier_bands=3, use_exp_decay=True, rngs=nn.Rngs(0))
+    features = feature_map(jnp.float32(0.25), batch_dim=4)
+
+    assert features.shape == (4, 8)
+    assert jnp.all(jnp.isfinite(features))
+    assert feature_map.output_dim == 8
+    assert float(feature_map.decay_rate()) > 0.0
+
+
+def test_attention_residuals_even_logits_preserve_odd_equivariance():
+    residuals = AttentionResiduals(
+        num_layers=2, feature_dim=4, rngs=nn.Rngs(0), use_even_logits=True
+    )
+    blocks = [
+        jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4) / 10.0,
+        jnp.ones((2, 3, 4), dtype=jnp.float32),
+    ]
+    partial = -0.5 * jnp.ones((2, 3, 4), dtype=jnp.float32)
+
+    out = residuals(blocks, partial, layer_index=1)
+    flipped_out = residuals([-block for block in blocks], -partial, layer_index=1)
+
+    assert out.shape == partial.shape
+    assert jnp.allclose(flipped_out, -out, atol=1e-5)
 
 
 ALL_WAVEFUNCTIONS = [
@@ -161,8 +190,8 @@ def test_autoregressive_time_gate_is_multiplicative_odd_silu_path():
 
     batch_dim = 3
     t = jnp.float32(0.25)
-    t_val = jnp.full((batch_dim, 1), t)
-    expected = odd_silu(amp_model.time_mlp1(t_val))
+    time_features = amp_model.time_features(t, batch_dim)
+    expected = odd_silu(amp_model.time_mlp1(time_features))
     expected = odd_silu(amp_model.time_mlp2(expected))
     expected = 1.0 + odd_silu(amp_model.time_mlp3(expected))
 

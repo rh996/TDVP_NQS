@@ -7,6 +7,7 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -15,8 +16,12 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".mpl-cache"))
 
 from src.grad import _ModelWavefunctionView
-from src.observables import sample_and_measure_observables
-from src.TDVP import TrainingConfig, train_loop
+from src.observables import (
+    enumerate_binary_configurations,
+    normalized_statevector,
+    sample_and_measure_observables,
+)
+from src.TDVP import TrainingConfig, save_training_checkpoint, train_loop
 from src.wavefunction import AutoregressiveNQS
 
 
@@ -31,10 +36,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-steps", type=int, default=10)
     parser.add_argument("--t-initial", type=float, default=0.0)
     parser.add_argument("--t-final", type=float, default=1.0)
-    parser.add_argument("--optimizer-name", type=str, default="adamw")
+    parser.add_argument("--optimizer-name", type=str, default="muon")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
+    parser.add_argument(
+        "--fixed-time-grid",
+        action="store_true",
+        help="Disable random continuous-time collocation and train only on the fixed time grid.",
+    )
+    parser.add_argument(
+        "--residual-loss-mode",
+        choices=("variance", "schrodinger_l2", "phase_speed"),
+        default="phase_speed",
+        help="Residual loss mode. Defaults to phase_speed for autoregressive training.",
+    )
     parser.add_argument("--use-unique-ar-samples", action="store_true")
     parser.add_argument(
         "--pretrain-steps",
@@ -46,6 +62,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-ic", type=float, default=10.0)
     parser.add_argument("--target-site", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--save-statevector-max-sites",
+        type=int,
+        default=16,
+        help=(
+            "Maximum N for exhaustive psi(x,t) export. "
+            "Set lower to avoid large 2^N statevector files."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -71,6 +96,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         gradient_clip_norm=args.gradient_clip_norm,
+        residual_loss_mode=args.residual_loss_mode,
         n_steps=args.n_steps,
         n_samples_per_chain=args.n_samples_per_chain,
         burn_in=0,
@@ -81,6 +107,7 @@ def main() -> None:
         t_initial=args.t_initial,
         t_final=args.t_final,
         time_steps=args.time_steps,
+        random_time_collocation=not args.fixed_time_grid,
         pretrain_steps=args.pretrain_steps,
         pretrain_lr=args.pretrain_lr,
         lambda_ic=args.lambda_ic,
@@ -101,8 +128,10 @@ def main() -> None:
         f"n_chains={config.n_chains}, "
         f"n_samples_per_chain={config.n_samples_per_chain}, "
         f"use_unique_ar_samples={config.use_unique_ar_samples}, "
+        f"residual_loss_mode={config.residual_loss_mode}, "
         f"pretrain_steps={config.pretrain_steps}, "
-        f"pretrain_time_slices={config.time_steps}"
+        f"time_steps={config.time_steps}, "
+        f"random_time_collocation={config.random_time_collocation}"
     )
     result = train_loop(config, verbose=True, initial_wavefunction=wf)
     metrics = result["metrics_history"]
@@ -175,6 +204,47 @@ def main() -> None:
     plt.savefig(x_path, dpi=150)
     plt.close()
     print(f"Saved X(t) plot to {x_path}")
+
+    checkpoint_path = output_dir / "final_wavefunction.pkl"
+    save_training_checkpoint(
+        str(checkpoint_path),
+        wf=result["wavefunction"],
+        ham=result["hamiltonian"],
+        config=result["config"],
+        metrics_history=result["metrics_history"],
+        global_step=result["global_step"],
+        completed_time_steps=result["completed_time_steps"],
+        current_time=float(config.t_final),
+        chain_configurations=result["final_configurations"],
+        rng=result["rng"],
+        opt_state=result["opt_state"],
+    )
+    print(f"Saved final wavefunction checkpoint to {checkpoint_path}")
+
+    if config.N <= args.save_statevector_max_sites:
+        basis_configs = enumerate_binary_configurations(config.N)
+        psi_by_time = []
+        for t_val in times:
+            psi_by_time.append(normalized_statevector(result["wavefunction"], config.N, t_val))
+        psi_xt = jnp.stack(psi_by_time, axis=0)
+
+        psi_path = output_dir / "final_psi_xt.npz"
+        np.savez(
+            psi_path,
+            times=np.asarray(jax.device_get(times)),
+            configurations=np.asarray(jax.device_get(basis_configs), dtype=np.int32),
+            psi=np.asarray(jax.device_get(psi_xt)),
+            psi_real=np.asarray(jax.device_get(jnp.real(psi_xt))),
+            psi_imag=np.asarray(jax.device_get(jnp.imag(psi_xt))),
+            probability=np.asarray(jax.device_get(jnp.abs(psi_xt) ** 2)),
+        )
+        print(f"Saved normalized psi(x,t) table to {psi_path}")
+    else:
+        print(
+            "Skipped exhaustive psi(x,t) export because "
+            f"N={config.N} exceeds --save-statevector-max-sites="
+            f"{args.save_statevector_max_sites}."
+        )
 
 
 if __name__ == "__main__":

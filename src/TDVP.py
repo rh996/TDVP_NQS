@@ -63,6 +63,7 @@ class TrainingConfig:
     gradient_clip_norm: Optional[float] = None
     n_steps: int = 100
     batch_size: int = 32
+    residual_loss_mode: str = "variance"
 
     # Sampling
     n_samples_per_chain: int = 32
@@ -76,6 +77,7 @@ class TrainingConfig:
     t_initial: float = 0.0
     t_final: float = 1.0
     time_steps: int = 10
+    random_time_collocation: bool = False
 
     # Initial Condition Anchoring (t=0)
     pretrain_steps: int = 0
@@ -103,6 +105,11 @@ def _validate_training_config(config: TrainingConfig) -> None:
     if config.optimizer_name.lower() not in ("adamw", "muon"):
         raise ValueError(
             f"Unsupported optimizer_name {config.optimizer_name!r}; only 'adamw' and 'muon' are currently supported."
+        )
+    if config.residual_loss_mode not in ("variance", "schrodinger_l2", "phase_speed"):
+        raise ValueError(
+            "residual_loss_mode must be one of {'variance', 'schrodinger_l2', 'phase_speed'}, "
+            f"got {config.residual_loss_mode!r}"
         )
     if not 0.0 <= config.adamw_b1 < 1.0:
         raise ValueError(f"adamw_b1 must be in [0, 1), got {config.adamw_b1}")
@@ -138,6 +145,26 @@ def _validate_training_config(config: TrainingConfig) -> None:
             n_chains=config.n_chains,
             n_sites=config.N,
         )
+
+
+def _stratified_random_train_times(
+    key: jax.Array,
+    *,
+    t_initial: float,
+    t_final: float,
+    n_times: int,
+) -> jnp.ndarray:
+    """Return t_initial plus one random collocation time from each interval."""
+    if n_times <= 1:
+        return jnp.asarray([t_initial], dtype=jnp.float32)
+
+    n_random_times = n_times - 1
+    edges = jnp.linspace(t_initial, t_final, n_random_times + 1, dtype=jnp.float32)
+    lower = edges[:-1]
+    upper = edges[1:]
+    u = jax.random.uniform(key, (n_random_times,), dtype=jnp.float32)
+    random_times = lower + u * (upper - lower)
+    return jnp.concatenate([jnp.asarray([t_initial], dtype=jnp.float32), random_times])
 
 
 def _initialize_wavefunction(config: TrainingConfig, rng: jax.Array) -> tSpinNQS:
@@ -493,7 +520,7 @@ def train_loop(
         if verbose:
             print(
                 "\n=== Pretraining initial condition (X-polarized) "
-                f"across {config.time_steps} time slices for {config.pretrain_steps} steps ==="
+                f"at t={config.t_initial:.6f} for {config.pretrain_steps} steps ==="
             )
 
         pretrain_optimizer = optax.adam(config.pretrain_lr)
@@ -510,7 +537,7 @@ def train_loop(
                     configs,
                     config.N,
                     ic_target_logp,
-                    times,
+                    config.t_initial,
                 )
 
             loss, grad = nnx.value_and_grad(loss_fn)(model)
@@ -573,6 +600,7 @@ def train_loop(
     time_indices = list(range(start_time_index, config.time_steps))
     # Active time slices for this run
     active_times = times[jnp.array(time_indices)]
+    n_active_times = len(time_indices)
 
     @nnx.jit
     def jitted_trajectory_train_step(model, opt_st, configs, rng_val):
@@ -581,12 +609,21 @@ def train_loop(
         # 1) Sample spacetime trajectory (warm-started or autoregressive)
         # all_samples: (T_active, C, S, N)
         # next_configs: (C, N)
-        rng_val, rng_sample = jax.random.split(rng_val)
+        rng_val, rng_time, rng_sample = jax.random.split(rng_val, 3)
+        if config.random_time_collocation:
+            train_times = _stratified_random_train_times(
+                rng_time,
+                t_initial=config.t_initial,
+                t_final=config.t_final,
+                n_times=n_active_times,
+            )
+        else:
+            train_times = active_times
         
         if hasattr(model, 'amp_model'):
             all_samples, all_stats, next_configs = autoregressive_trajectory_sample(
                 wf=wf_view,
-                times=active_times,
+                times=train_times,
                 n_sites=ham.N,
                 batch_size=config.n_chains * config.n_samples_per_chain,
                 key=rng_sample,
@@ -597,7 +634,7 @@ def train_loop(
             all_samples, all_stats, next_configs = metropolis_hastings_trajectory(
                 wf=wf_view,
                 initial_configurations=configs,
-                times=active_times,
+                times=train_times,
                 n_sites=ham.N,
                 n_samples=config.n_samples_per_chain,
                 burn_in=config.burn_in,
@@ -607,7 +644,7 @@ def train_loop(
 
         # Reshape for unified gradient computation
         # T_active is the number of time slices being optimized jointly
-        T_active = active_times.shape[0]
+        T_active = train_times.shape[0]
         batch_size_per_slice = config.n_chains * config.n_samples_per_chain
         all_configs_batch = all_samples.reshape((T_active, batch_size_per_slice, ham.N))
         sample_weights = None
@@ -621,8 +658,9 @@ def train_loop(
             ham=ham,
             wf=wf_view,
             all_configurations=all_configs_batch,
-            times=active_times,
+            times=train_times,
             sample_weights=sample_weights,
+            loss_mode=config.residual_loss_mode,
         )
 
         # Add sampling diagnostics (mean across active time slices)
@@ -630,6 +668,9 @@ def train_loop(
         if hasattr(model, 'amp_model'):
             diag["ar_unique_count"] = jnp.mean(all_stats["unique_count"])
             diag["ar_unique_fraction"] = jnp.mean(all_stats["unique_fraction"])
+        diag["time_mean"] = jnp.mean(train_times)
+        diag["time_min"] = jnp.min(train_times)
+        diag["time_max"] = jnp.max(train_times)
 
         # 3) Initial Condition Anchoring (Lagrangian Penalty at t=0)
         if config.lambda_ic > 0.0:
@@ -685,7 +726,7 @@ def train_loop(
             if key in diag:
                 metrics_history[key].append(float(diag[key]))
 
-        metrics_history["time"].append(float(jnp.mean(active_times)))
+        metrics_history["time"].append(float(diag["time_mean"]))
         metrics_history["step"].append(global_step)
 
         if verbose:

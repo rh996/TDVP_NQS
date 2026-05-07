@@ -256,6 +256,52 @@ def test_tdvp_vmc_trajectory_gradient_returns_valid_output():
     assert jnp.isfinite(diag["grad_norm_total"])
 
 
+def test_tdvp_vmc_trajectory_gradient_supports_schrodinger_l2_loss():
+    import jax
+
+    N = 4
+    ham = TransverseIsingHamiltonian(J=1.0, h=0.5, N=N)
+    wf = _make_wf(N=N, seed=43)
+
+    times = jnp.array([0.0, 0.1], dtype=jnp.float32)
+    all_configs = jax.random.randint(jax.random.PRNGKey(1), (2, 4, N), 0, 2)
+
+    grad_total, diag = tdvp_vmc_trajectory_gradient(
+        ham=ham,
+        wf=wf,
+        all_configurations=all_configs,
+        times=times,
+        loss_mode="schrodinger_l2",
+    )
+
+    _assert_tree_all_finite(grad_total)
+    assert float(_tree_l2_norm(grad_total)) > 0.0
+    assert jnp.isfinite(diag["loss"])
+
+
+def test_tdvp_vmc_trajectory_gradient_supports_phase_speed_loss():
+    import jax
+
+    N = 4
+    ham = TransverseIsingHamiltonian(J=1.0, h=0.5, N=N)
+    wf = _make_wf(N=N, seed=44)
+
+    times = jnp.array([0.0, 0.1], dtype=jnp.float32)
+    all_configs = jax.random.randint(jax.random.PRNGKey(2), (2, 4, N), 0, 2)
+
+    grad_total, diag = tdvp_vmc_trajectory_gradient(
+        ham=ham,
+        wf=wf,
+        all_configurations=all_configs,
+        times=times,
+        loss_mode="phase_speed",
+    )
+
+    _assert_tree_all_finite(grad_total)
+    assert float(_tree_l2_norm(grad_total)) > 0.0
+    assert jnp.isfinite(diag["loss"])
+
+
 def test_weighted_trajectory_gradient_matches_expanded_duplicates():
     import jax
 
