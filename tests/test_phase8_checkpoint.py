@@ -9,7 +9,7 @@ from src.TDVP import (
     save_training_checkpoint,
     train_loop,
 )
-from src.wavefunction import AutoregressiveNQS
+from src.wavefunction import AutoregressiveNQS, NeuralGalerkinNQS
 
 
 def _make_config():
@@ -227,3 +227,50 @@ def test_autoregressive_wavefunction_checkpoint_roundtrip(tmp_path: Path):
     loaded = load_training_checkpoint(str(checkpoint_path))
 
     assert isinstance(loaded["wavefunction"], AutoregressiveNQS)
+
+
+def test_neural_galerkin_checkpoint_roundtrip(tmp_path: Path):
+    import flax.nnx as nnx
+
+    config = _make_config()
+    config.n_steps = 1
+    config.num_galerkin_basis = 2
+    config.num_galerkin_modes = 2
+    wf = NeuralGalerkinNQS(
+        N=config.N,
+        Num_boxes=config.Num_boxes,
+        emb_dim=config.emb_dim,
+        num_heads=config.num_heads,
+        head_dim=config.head_dim,
+        num_basis=config.num_galerkin_basis,
+        num_modes=config.num_galerkin_modes,
+        rngs=nnx.Rngs(config.seed),
+    )
+    result = train_loop(config, verbose=False, initial_wavefunction=wf)
+
+    checkpoint_path = tmp_path / "neural_galerkin_checkpoint.pkl"
+    save_training_checkpoint(
+        str(checkpoint_path),
+        wf=result["wavefunction"],
+        ham=result["hamiltonian"],
+        config=result["config"],
+        metrics_history=result["metrics_history"],
+        global_step=result["global_step"],
+        completed_time_steps=result["completed_time_steps"],
+        current_time=0.0,
+        chain_configurations=result["final_configurations"],
+        rng=result["rng"],
+        opt_state=result["opt_state"],
+    )
+
+    loaded = load_training_checkpoint(str(checkpoint_path))
+    configs = jnp.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=jnp.int32)
+
+    logp_before, phi_before = result["wavefunction"](configs, jnp.float32(0.3))
+    logp_after, phi_after = loaded["wavefunction"](configs, jnp.float32(0.3))
+
+    assert isinstance(loaded["wavefunction"], NeuralGalerkinNQS)
+    assert loaded["config"].num_galerkin_basis == 2
+    assert loaded["config"].num_galerkin_modes == 2
+    assert jnp.allclose(logp_before, logp_after, atol=1e-6)
+    assert jnp.allclose(phi_before, phi_after, atol=1e-6)

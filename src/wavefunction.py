@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 import flax.nnx as nn
 import jax
 import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
 
 
 def xsa_output(
@@ -772,6 +773,292 @@ class SimpleSpinNQS(Wavefunction):
 
     def __call__(self, configuration: jnp.ndarray, t: jnp.float32):
         logp, phi = self.model(configuration, t)
+        return self._squeeze_last_dim(logp), self._squeeze_last_dim(phi)
+
+    @staticmethod
+    def _squeeze_last_dim(x: jnp.ndarray) -> jnp.ndarray:
+        if x.ndim > 1 and x.shape[-1] == 1:
+            return jnp.squeeze(x, axis=-1)
+        return x
+
+
+class StaticEncoder(nn.Module):
+    """Encode spin configurations without any explicit time dependence."""
+
+    def __init__(self, seq_dim, embed_dim, rngs: nn.Rngs):
+        self.spin_embeds = nn.Param(jax.random.normal(rngs(), (1, embed_dim)))
+        self.pos_embeds = nn.Embed(seq_dim, embed_dim, rngs=rngs)
+        self.seq_dim = seq_dim
+
+    def __call__(self, configuration: jnp.ndarray):
+        configuration = configuration.astype(jnp.int32)
+
+        if len(configuration.shape) != 2:
+            configuration = jnp.expand_dims(configuration, axis=0)
+
+        if configuration.shape[1] != self.seq_dim:
+            raise ValueError(
+                f"Expected sequence length {self.seq_dim}, got {configuration.shape[1]}"
+            )
+
+        batch_dim = configuration.shape[0]
+        positions = jnp.arange(self.seq_dim)[jnp.newaxis, :].repeat(batch_dim, axis=0)
+        spins = 1.0 - 2.0 * configuration
+        token_features = spins[:, :, jnp.newaxis] * self.spin_embeds.get_value()
+        return token_features + self.pos_embeds(positions)
+
+
+class StaticBasisNQS(nn.Module):
+    """Time-independent transformer basis state psi_i(sigma)."""
+
+    def __init__(
+        self,
+        N: int,
+        Num_boxes: int,
+        emb_dim: int,
+        num_heads: int,
+        head_dim: int,
+        rngs: nn.Rngs,
+    ):
+        self.N = N
+        self.Num_boxes = Num_boxes
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+        self.encoder = StaticEncoder(self.N, emb_dim, rngs=rngs)
+        self.layers = nn.data([])
+        for _ in range(Num_boxes):
+            self.layers.append(
+                OldBoxLayer(self.emb_dim, self.num_heads, self.head_dim, rngs=rngs)
+            )
+        self.attn_residuals = AttentionResiduals(Num_boxes, self.emb_dim, rngs=rngs)
+
+        self.head_hidden_dim = self.emb_dim
+        self.log_amp_head = nn.Linear(
+            self.emb_dim,
+            self.head_hidden_dim,
+            rngs=rngs,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )
+        self.log_amp_out = nn.Linear(
+            self.head_hidden_dim,
+            1,
+            use_bias=False,
+            rngs=rngs,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )
+        self.phase_head = nn.Linear(
+            self.emb_dim,
+            self.head_hidden_dim,
+            rngs=rngs,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )
+        self.phase_out = nn.Linear(
+            self.head_hidden_dim,
+            1,
+            use_bias=False,
+            rngs=rngs,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )
+
+    def __call__(self, configuration: jnp.ndarray):
+        x = self.encoder(configuration)
+        blocks = [x]
+        partial = jnp.zeros_like(x)
+        for i, layer in enumerate(self.layers):
+            h = self.attn_residuals(blocks, partial, i)
+            partial = partial + layer.residual_delta(h)
+            blocks.append(partial)
+            partial = jnp.zeros_like(partial)
+        x = attention_residual_output(self.attn_residuals, blocks, partial)
+        x = jnp.mean(x, axis=1)
+        logp = self.log_amp_out(nn.tanh(self.log_amp_head(x)))
+        phi = jnp.pi * jax.nn.soft_sign(self.phase_out(nn.tanh(self.phase_head(x))))
+        return logp, phi
+
+
+class NeuralGalerkinNQSModel(nn.Module):
+    """Neural Galerkin ansatz with fixed uniform psi_0 and learned bases."""
+
+    def __init__(
+        self,
+        N: int,
+        Num_boxes: int,
+        emb_dim: int,
+        num_heads: int,
+        head_dim: int,
+        num_basis: int,
+        num_modes: int,
+        rngs: nn.Rngs,
+    ):
+        if num_basis <= 0:
+            raise ValueError(f"num_basis must be > 0, got {num_basis}")
+        if num_modes <= 0:
+            raise ValueError(f"num_modes must be > 0, got {num_modes}")
+
+        self.N = N
+        self.Num_boxes = Num_boxes
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_basis = num_basis
+        self.num_modes = num_modes
+
+        self.bases = nn.data([])
+        for _ in range(num_basis):
+            self.bases.append(
+                StaticBasisNQS(N, Num_boxes, emb_dim, num_heads, head_dim, rngs=rngs)
+            )
+
+        gamma_shape = (num_basis, num_modes)
+        self.gamma_real = nn.Param(0.01 * jax.random.normal(rngs(), gamma_shape))
+        self.gamma_imag = nn.Param(0.01 * jax.random.normal(rngs(), gamma_shape))
+        self.omega = nn.Param(0.01 * jax.random.normal(rngs(), (num_modes,)))
+
+    def coefficients(self, t) -> jnp.ndarray:
+        t = jnp.asarray(t, dtype=jnp.float32)
+        exponent = jnp.clip(self.omega.get_value() * t, min=-20.0, max=20.0)
+        time_modes = jnp.exp(exponent) - 1.0
+        gamma = self.gamma_real.get_value() + 1j * self.gamma_imag.get_value()
+        return jnp.sum(gamma * time_modes[jnp.newaxis, :], axis=-1)
+
+    def _as_batched_configuration(self, configuration: jnp.ndarray) -> jnp.ndarray:
+        configuration = jnp.asarray(configuration)
+        if configuration.ndim == 1:
+            configuration = configuration[jnp.newaxis, :]
+        return configuration
+
+    def basis_values(self, configuration: jnp.ndarray) -> jnp.ndarray:
+        """Return psi_i(sigma) for psi_0 and all learned static bases.
+
+        Shape is (num_basis + 1, batch). The first row is the fixed uniform
+        basis psi_0(sigma)=1.
+        """
+        configuration = self._as_batched_configuration(configuration)
+        batch_dim = configuration.shape[0]
+
+        psi0 = jnp.full(
+            (batch_dim,),
+            1.0,
+            dtype=jnp.complex64,
+        )
+
+        basis_values = []
+        for basis in self.bases:
+            logp_i, phi_i = basis(configuration)
+            logp_i = jnp.squeeze(jnp.asarray(logp_i), axis=-1)
+            phi_i = jnp.squeeze(jnp.asarray(phi_i), axis=-1)
+            basis_values.append(jnp.exp(0.5 * logp_i + 1j * phi_i))
+        return jnp.concatenate([psi0[jnp.newaxis, :], jnp.stack(basis_values, axis=0)])
+
+    def __call__(self, configuration: jnp.ndarray, t: jnp.float32):
+        basis_values = self.basis_values(configuration)
+        coeffs = jnp.concatenate(
+            [
+                jnp.asarray([1.0 + 0.0j], dtype=jnp.complex64),
+                self.coefficients(t).astype(jnp.complex64),
+            ]
+        )
+        psi = jnp.sum(coeffs[:, jnp.newaxis] * basis_values, axis=0)
+
+        amp = jnp.maximum(jnp.abs(psi), 1e-12)
+        logp = 2.0 * jnp.log(amp)
+        phi = jnp.angle(psi)
+        return logp, phi
+
+
+class NeuralGalerkinNQS(Wavefunction):
+    """Wavefunction wrapper for the fixed-psi0 Neural Galerkin ansatz."""
+
+    def __init__(
+        self,
+        N: int,
+        Num_boxes: int,
+        emb_dim: int,
+        num_heads: int,
+        head_dim: int,
+        rngs: nn.Rngs,
+        num_basis: int = 4,
+        num_modes: int = 4,
+    ):
+        self.N = N
+        self.Num_boxes = Num_boxes
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_basis = num_basis
+        self.num_modes = num_modes
+        self.rngs = rngs
+        self.model = NeuralGalerkinNQSModel(
+            N=self.N,
+            Num_boxes=self.Num_boxes,
+            emb_dim=self.emb_dim,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            num_basis=self.num_basis,
+            num_modes=self.num_modes,
+            rngs=self.rngs,
+        )
+
+    def __call__(self, configuration: jnp.ndarray, t: jnp.float32):
+        logp, phi = self.model(configuration, t)
+        return self._squeeze_last_dim(logp), self._squeeze_last_dim(phi)
+
+    @staticmethod
+    def _squeeze_last_dim(x: jnp.ndarray) -> jnp.ndarray:
+        if x.ndim > 1 and x.shape[-1] == 1:
+            return jnp.squeeze(x, axis=-1)
+        return x
+
+
+class FixedCoefficientNeuralGalerkinNQS(Wavefunction):
+    """Use a trained Neural Galerkin basis with fixed ODE coefficients.
+
+    The basis networks are shared from the trained `NeuralGalerkinNQS`; the
+    learned gamma/omega coefficient model is ignored. Coefficients evolve as
+    c(t)=exp(-i (t-t_initial) generator)c(0), with c(0)=(1,0,...).
+    """
+
+    def __init__(
+        self,
+        basis_wavefunction: NeuralGalerkinNQS,
+        generator: jnp.ndarray,
+        *,
+        t_initial: float = 0.0,
+    ):
+        self.N = basis_wavefunction.N
+        self.Num_boxes = basis_wavefunction.Num_boxes
+        self.emb_dim = basis_wavefunction.emb_dim
+        self.num_heads = basis_wavefunction.num_heads
+        self.head_dim = basis_wavefunction.head_dim
+        self.num_basis = basis_wavefunction.num_basis
+        self.num_modes = basis_wavefunction.num_modes
+        self.basis_wavefunction = basis_wavefunction
+        self.model = basis_wavefunction.model
+        self.generator = jnp.asarray(generator, dtype=jnp.complex64)
+        self.t_initial = float(t_initial)
+
+        expected_shape = (self.num_basis + 1, self.num_basis + 1)
+        if self.generator.shape != expected_shape:
+            raise ValueError(
+                f"Expected generator shape {expected_shape}, got {self.generator.shape}"
+            )
+
+    def coefficients(self, t) -> jnp.ndarray:
+        t = jnp.asarray(t, dtype=jnp.float32)
+        c0 = jnp.zeros((self.num_basis + 1,), dtype=jnp.complex64)
+        c0 = c0.at[0].set(1.0 + 0.0j)
+        propagator = jsp_linalg.expm(-1j * (t - self.t_initial) * self.generator)
+        return propagator @ c0
+
+    def __call__(self, configuration: jnp.ndarray, t: jnp.float32):
+        basis_values = self.basis_wavefunction.model.basis_values(configuration)
+        coeffs = self.coefficients(t)
+        psi = jnp.sum(coeffs[:, jnp.newaxis] * basis_values, axis=0)
+        amp = jnp.maximum(jnp.abs(psi), 1e-12)
+        logp = 2.0 * jnp.log(amp)
+        phi = jnp.angle(psi)
         return self._squeeze_last_dim(logp), self._squeeze_last_dim(phi)
 
     @staticmethod

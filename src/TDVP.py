@@ -31,6 +31,7 @@ from src.sampler import (
 from src.wavefunction import (
     AutoregressiveNQS,
     AutoregressiveNQS_Z2,
+    NeuralGalerkinNQS,
     SimpleSpinNQS,
     Wavefunction,
     tSpinNQS,
@@ -52,6 +53,8 @@ class TrainingConfig:
     emb_dim: int
     num_heads: int
     head_dim: int
+    num_galerkin_basis: int = 4
+    num_galerkin_modes: int = 4
 
     # Training
     learning_rate: float = 0.001
@@ -100,6 +103,14 @@ def _validate_training_config(config: TrainingConfig) -> None:
         raise ValueError(f"n_steps must be > 0, got {config.n_steps}")
     if config.time_steps <= 0:
         raise ValueError(f"time_steps must be > 0, got {config.time_steps}")
+    if config.num_galerkin_basis <= 0:
+        raise ValueError(
+            f"num_galerkin_basis must be > 0, got {config.num_galerkin_basis}"
+        )
+    if config.num_galerkin_modes <= 0:
+        raise ValueError(
+            f"num_galerkin_modes must be > 0, got {config.num_galerkin_modes}"
+        )
     if config.learning_rate <= 0:
         raise ValueError(f"learning_rate must be > 0, got {config.learning_rate}")
     if config.optimizer_name.lower() not in ("adamw", "muon"):
@@ -355,18 +366,23 @@ def load_training_checkpoint(filepath: str) -> Dict[str, Any]:
         "SimpleSpinNQS": SimpleSpinNQS,
         "AutoregressiveNQS": AutoregressiveNQS,
         "AutoregressiveNQS_Z2": AutoregressiveNQS_Z2,
+        "NeuralGalerkinNQS": NeuralGalerkinNQS,
     }.get(wavefunction_type)
     if wavefunction_cls is None:
         raise ValueError(f"Unsupported wavefunction_type in checkpoint: {wavefunction_type}")
 
-    wf = wavefunction_cls(
-        N=config.N,
-        Num_boxes=config.Num_boxes,
-        emb_dim=config.emb_dim,
-        num_heads=config.num_heads,
-        head_dim=config.head_dim,
-        rngs=nnx.Rngs(config.seed),
-    )
+    wf_kwargs = {
+        "N": config.N,
+        "Num_boxes": config.Num_boxes,
+        "emb_dim": config.emb_dim,
+        "num_heads": config.num_heads,
+        "head_dim": config.head_dim,
+        "rngs": nnx.Rngs(config.seed),
+    }
+    if wavefunction_cls is NeuralGalerkinNQS:
+        wf_kwargs["num_basis"] = config.num_galerkin_basis
+        wf_kwargs["num_modes"] = config.num_galerkin_modes
+    wf = wavefunction_cls(**wf_kwargs)
     nnx.update(wf.model, payload["model_state"])
 
     hamiltonian_payload = dict(payload["hamiltonian"])

@@ -15,6 +15,7 @@ The current development path focuses on autoregressive wavefunctions, exact Born
 - `tSpinNQS_Z2`: Z2-symmetric transformer NQS.
 - `AutoregressiveNQS`: non-Z2 autoregressive amplitude model plus phase network.
 - `AutoregressiveNQS_Z2`: Z2-constrained autoregressive amplitude model.
+- `NeuralGalerkinNQS`: fixed unnormalized uniform `psi_0` plus trainable transformer basis states with explicit time coefficients.
 - Direct autoregressive sampling with logical `n_chains` batching.
 - MCMC trajectory sampling for non-autoregressive models.
 - Transformer attention with XSA: exclusive self-attention projects out the self-value direction.
@@ -104,6 +105,21 @@ python example/train_mcmc_tspinnqs.py \
   --time-steps 10
 ```
 
+### Neural Galerkin TFIM
+
+```bash
+python example/train_neural_galerkin_tfim.py \
+  --n-sites 8 \
+  --num-basis 4 \
+  --num-modes 4 \
+  --n-steps 500 \
+  --n-chains 16 \
+  --n-samples-per-chain 256 \
+  --time-steps 10
+```
+
+This model uses MCMC and `variance` loss by default because the Galerkin wavefunction is not autoregressively normalized.
+
 ## Important Arguments
 
 - `--optimizer-name`: `muon` or `adamw`. Autoregressive examples default to `muon`.
@@ -112,6 +128,9 @@ python example/train_mcmc_tspinnqs.py \
 - `--n-steps`: TDVP optimization steps.
 - `--time-steps`: number of time collocation points per training step.
 - `--fixed-time-grid`: disables random time collocation and uses the fixed grid.
+- `--measure-time-steps`: number of post-training time points for observable plots.
+- `--measure-t-initial`: initial time for post-training observable plots.
+- `--measure-t-final`: final time for post-training observable plots. AR examples default to one extra training window beyond `t_final`.
 - `--n-chains`: parallel chains for MCMC, or logical AR batch groups.
 - `--n-samples-per-chain`: samples per chain/logical chain per time slice.
 - `--pretrain-steps`: initial-state pretraining steps at `t_initial`.
@@ -120,6 +139,8 @@ python example/train_mcmc_tspinnqs.py \
 - `--use-unique-ar-samples`: compress AR samples with static-shape unique counts.
 - `--save-statevector-max-sites`: maximum system size for exhaustive `psi(x,t)` export.
 - `--alpha`: long-range power-law exponent for LRTFIM examples.
+- `--num-basis`: number of trainable Neural Galerkin basis states.
+- `--num-modes`: number of exponential time-coefficient modes per basis.
 
 ## Loss Notation
 
@@ -181,6 +202,7 @@ Use `--fixed-time-grid` to train only on the deterministic grid.
 - `example/train_autoregressive.py`: Z2 autoregressive TFIM training.
 - `example/train_autoregressive_no_z2.py`: non-Z2 autoregressive TFIM training.
 - `example/train_autoregressive_lrtfim.py`: Z2 autoregressive long-range TFIM training with energy curves and checkpoints.
+- `example/train_neural_galerkin_tfim.py`: Neural Galerkin TFIM training with MCMC and variance loss.
 - `example/train_fully_polarized_chain.py`: MCMC TDVP from a fully polarized chain.
 - `example/train_mcmc_tspinnqs.py`: explicit MCMC example using `tSpinNQS`.
 - `example/train_simple_nqs.py`: simple NQS architecture example.

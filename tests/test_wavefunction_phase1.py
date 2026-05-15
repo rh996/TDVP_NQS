@@ -7,6 +7,8 @@ from src.wavefunction import (
     AutoregressiveNQS,
     AutoregressiveNQS_Z2,
     CausalTransformerLayer,
+    FixedCoefficientNeuralGalerkinNQS,
+    NeuralGalerkinNQS,
     SimpleSpinNQS,
     TimeFeatureMap,
     odd_silu,
@@ -108,6 +110,7 @@ ALL_WAVEFUNCTIONS = [
     SimpleSpinNQS,
     AutoregressiveNQS,
     AutoregressiveNQS_Z2,
+    NeuralGalerkinNQS,
 ]
 Z2_WAVEFUNCTIONS = [tSpinNQS_Z2, SimpleSpinNQS, AutoregressiveNQS_Z2]
 
@@ -200,6 +203,116 @@ def test_autoregressive_time_gate_is_multiplicative_odd_silu_path():
     assert hasattr(amp_model, "time_mlp3")
     assert actual.shape == (batch_dim, amp_model.emb_dim)
     assert jnp.allclose(actual, expected, atol=1e-6)
+
+
+def test_neural_galerkin_coefficients_are_zero_at_initial_time():
+    wf = NeuralGalerkinNQS(
+        N=4,
+        Num_boxes=1,
+        emb_dim=8,
+        num_heads=2,
+        head_dim=4,
+        num_basis=3,
+        num_modes=2,
+        rngs=nn.Rngs(0),
+    )
+
+    coeffs = wf.model.coefficients(jnp.float32(0.0))
+
+    assert coeffs.shape == (3,)
+    assert jnp.allclose(coeffs, 0.0, atol=1e-7)
+
+
+def test_neural_galerkin_is_uniform_unnormalized_at_t0():
+    wf = NeuralGalerkinNQS(
+        N=4,
+        Num_boxes=1,
+        emb_dim=8,
+        num_heads=2,
+        head_dim=4,
+        num_basis=2,
+        num_modes=2,
+        rngs=nn.Rngs(1),
+    )
+    configs = jnp.array(
+        [
+            [0, 0, 0, 0],
+            [0, 1, 0, 1],
+            [1, 1, 1, 1],
+        ],
+        dtype=jnp.int32,
+    )
+
+    logp, phi = wf(configs, jnp.float32(0.0))
+
+    assert jnp.allclose(logp, 0.0, atol=1e-6)
+    assert jnp.allclose(phi, 0.0, atol=1e-6)
+
+
+def test_neural_galerkin_basis_values_include_uniform_basis():
+    wf = NeuralGalerkinNQS(
+        N=4,
+        Num_boxes=1,
+        emb_dim=8,
+        num_heads=2,
+        head_dim=4,
+        num_basis=2,
+        num_modes=2,
+        rngs=nn.Rngs(1),
+    )
+    configs = jnp.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=jnp.int32)
+
+    basis_values = wf.model.basis_values(configs)
+
+    assert basis_values.shape == (3, 2)
+    assert jnp.allclose(basis_values[0], 1.0 + 0.0j, atol=1e-6)
+    assert jnp.all(jnp.isfinite(jnp.real(basis_values)))
+    assert jnp.all(jnp.isfinite(jnp.imag(basis_values)))
+
+
+def test_fixed_coefficient_neural_galerkin_zero_generator_keeps_initial_state():
+    wf = NeuralGalerkinNQS(
+        N=4,
+        Num_boxes=1,
+        emb_dim=8,
+        num_heads=2,
+        head_dim=4,
+        num_basis=2,
+        num_modes=2,
+        rngs=nn.Rngs(2),
+    )
+    generator = jnp.zeros((3, 3), dtype=jnp.complex64)
+    ode_wf = FixedCoefficientNeuralGalerkinNQS(wf, generator)
+    configs = jnp.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=jnp.int32)
+
+    logp, phi = ode_wf(configs, jnp.float32(0.7))
+
+    assert jnp.allclose(logp, 0.0, atol=1e-6)
+    assert jnp.allclose(phi, 0.0, atol=1e-6)
+
+
+def test_neural_galerkin_outputs_change_after_initial_time():
+    wf = NeuralGalerkinNQS(
+        N=4,
+        Num_boxes=1,
+        emb_dim=8,
+        num_heads=2,
+        head_dim=4,
+        num_basis=2,
+        num_modes=2,
+        rngs=nn.Rngs(2),
+    )
+    configs = jnp.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=jnp.int32)
+
+    logp0, phi0 = wf(configs, jnp.float32(0.0))
+    logp1, phi1 = wf(configs, jnp.float32(0.7))
+
+    assert jnp.all(jnp.isfinite(logp1))
+    assert jnp.all(jnp.isfinite(phi1))
+    assert not (
+        jnp.allclose(logp0, logp1, atol=1e-7)
+        and jnp.allclose(phi0, phi1, atol=1e-7)
+    )
 
 
 def test_autoregressive_token_features_are_spin_flip_odd_with_zero_sos():

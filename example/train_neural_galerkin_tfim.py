@@ -7,7 +7,6 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
-import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -16,83 +15,44 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".mpl-cache"))
 
 from src.grad import _ModelWavefunctionView
-from src.observables import (
-    enumerate_binary_configurations,
-    normalized_statevector,
-    sample_and_measure_observables,
-)
+from src.observables import sample_and_measure_observables
 from src.TDVP import TrainingConfig, save_training_checkpoint, train_loop
-from src.wavefunction import AutoregressiveNQS
+from src.wavefunction import NeuralGalerkinNQS
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train the original non-Z2 AutoregressiveNQS with direct AR sampling."
+        description="Train Neural Galerkin NQS on short-range TFIM with MCMC."
     )
     parser.add_argument("--n-sites", type=int, default=4)
     parser.add_argument("--n-steps", type=int, default=200)
     parser.add_argument("--n-chains", type=int, default=4)
     parser.add_argument("--n-samples-per-chain", type=int, default=512)
+    parser.add_argument("--burn-in", type=int, default=50)
+    parser.add_argument("--thinning", type=int, default=5)
     parser.add_argument("--time-steps", type=int, default=10)
     parser.add_argument("--t-initial", type=float, default=0.0)
     parser.add_argument("--t-final", type=float, default=1.0)
-    parser.add_argument(
-        "--measure-time-steps",
-        type=int,
-        default=None,
-        help="Number of time points used for post-training observable plots.",
-    )
-    parser.add_argument(
-        "--measure-t-initial",
-        type=float,
-        default=None,
-        help="Initial time for post-training observable plots.",
-    )
-    parser.add_argument(
-        "--measure-t-final",
-        type=float,
-        default=None,
-        help="Final time for post-training observable plots. Defaults to one training window beyond t_final.",
-    )
-    parser.add_argument("--optimizer-name", type=str, default="muon")
+    parser.add_argument("--measure-time-steps", type=int, default=None)
+    parser.add_argument("--measure-t-initial", type=float, default=None)
+    parser.add_argument("--measure-t-final", type=float, default=None)
+    parser.add_argument("--num-basis", type=int, default=4)
+    parser.add_argument("--num-modes", type=int, default=16)
+    parser.add_argument("--optimizer-name", type=str, default="adamw")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
+    parser.add_argument("--target-site", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--fixed-time-grid",
         action="store_true",
         help="Disable random continuous-time collocation and train only on the fixed time grid.",
     )
     parser.add_argument(
-        "--residual-loss-mode",
-        choices=("variance", "schrodinger_l2", "phase_speed"),
-        default="phase_speed",
-        help="Residual loss mode. Defaults to phase_speed for autoregressive training.",
-    )
-    parser.add_argument("--use-unique-ar-samples", action="store_true")
-    parser.add_argument(
-        "--pretrain-steps",
-        type=int,
-        default=10,
-        help="Optional all-time-slice initial-condition pretraining steps.",
-    )
-    parser.add_argument("--pretrain-lr", type=float, default=0.005)
-    parser.add_argument("--lambda-ic", type=float, default=10.0)
-    parser.add_argument("--target-site", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--save-statevector-max-sites",
-        type=int,
-        default=16,
-        help=(
-            "Maximum N for exhaustive psi(x,t) export. "
-            "Set lower to avoid large 2^N statevector files."
-        ),
-    )
-    parser.add_argument(
         "--output-dir",
         type=Path,
-        default=ROOT / "example" / "outputs" / "autoregressive_no_z2",
+        default=ROOT / "example" / "outputs" / "neural_galerkin_tfim",
     )
     return parser.parse_args()
 
@@ -102,33 +62,34 @@ def main() -> None:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    initial_configs = jnp.ones((args.n_chains, args.n_sites), dtype=jnp.int32)
     config = TrainingConfig(
         N=args.n_sites,
         J=-1.0,
         h=0.5,
-        Num_boxes=3,
+        Num_boxes=2,
         emb_dim=16,
-        num_heads=4,
+        num_heads=2,
         head_dim=8,
+        num_galerkin_basis=args.num_basis,
+        num_galerkin_modes=args.num_modes,
         optimizer_name=args.optimizer_name,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         gradient_clip_norm=args.gradient_clip_norm,
-        residual_loss_mode=args.residual_loss_mode,
+        residual_loss_mode="variance",
         n_steps=args.n_steps,
         n_samples_per_chain=args.n_samples_per_chain,
-        burn_in=0,
-        thinning=1,
+        burn_in=args.burn_in,
+        thinning=args.thinning,
         n_chains=args.n_chains,
-        use_unique_ar_samples=args.use_unique_ar_samples,
-        initial_chain_configurations=jnp.ones((args.n_chains, args.n_sites), dtype=jnp.int32),
+        initial_chain_configurations=initial_configs,
         t_initial=args.t_initial,
         t_final=args.t_final,
         time_steps=args.time_steps,
         random_time_collocation=not args.fixed_time_grid,
-        pretrain_steps=args.pretrain_steps,
-        pretrain_lr=args.pretrain_lr,
-        lambda_ic=args.lambda_ic,
+        pretrain_steps=0,
+        lambda_ic=0.0,
         seed=args.seed,
     )
     measure_t_initial = (
@@ -147,23 +108,26 @@ def main() -> None:
     )
     if measure_time_steps <= 0:
         raise ValueError(f"measure_time_steps must be > 0, got {measure_time_steps}")
-    wf = AutoregressiveNQS(
+
+    wf = NeuralGalerkinNQS(
         N=config.N,
         Num_boxes=config.Num_boxes,
         emb_dim=config.emb_dim,
         num_heads=config.num_heads,
         head_dim=config.head_dim,
+        num_basis=config.num_galerkin_basis,
+        num_modes=config.num_galerkin_modes,
         rngs=nnx.Rngs(config.seed),
     )
 
     print(
-        "Running original non-Z2 AutoregressiveNQS: "
+        "Running NeuralGalerkinNQS with MCMC: "
         f"optimizer={config.optimizer_name.upper()}, "
+        f"num_basis={config.num_galerkin_basis}, "
+        f"num_modes={config.num_galerkin_modes}, "
+        f"loss={config.residual_loss_mode}, "
         f"n_chains={config.n_chains}, "
         f"n_samples_per_chain={config.n_samples_per_chain}, "
-        f"use_unique_ar_samples={config.use_unique_ar_samples}, "
-        f"residual_loss_mode={config.residual_loss_mode}, "
-        f"pretrain_steps={config.pretrain_steps}, "
         f"time_steps={config.time_steps}, "
         f"measure_time_steps={measure_time_steps}, "
         f"measure_interval=[{measure_t_initial}, {measure_t_final}], "
@@ -178,7 +142,7 @@ def main() -> None:
     plt.plot(metrics["step"], metrics["loss"], linewidth=1.5)
     plt.xlabel("Training Step")
     plt.ylabel("TDVP Loss")
-    plt.title("Original non-Z2 AutoregressiveNQS Training Loss")
+    plt.title("Neural Galerkin TFIM Training Loss")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(loss_path, dpi=150)
@@ -201,8 +165,8 @@ def main() -> None:
             n_sites=config.N,
             initial_configurations=configs,
             n_samples=config.n_samples_per_chain,
-            burn_in=0,
-            thinning=1,
+            burn_in=config.burn_in,
+            thinning=config.thinning,
             key=key,
         )
 
@@ -225,7 +189,7 @@ def main() -> None:
         plt.axvspan(config.t_final, measure_t_final, color="tab:gray", alpha=0.12)
     plt.xlabel("Time t")
     plt.ylabel(f"<Z_{args.target_site + 1}(t)>")
-    plt.title(f"Original non-Z2 AR Z_{args.target_site + 1}(t), N={config.N}")
+    plt.title(f"Neural Galerkin TFIM Z_{args.target_site + 1}(t), N={config.N}")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(z_path, dpi=150)
@@ -240,7 +204,7 @@ def main() -> None:
         plt.axvspan(config.t_final, measure_t_final, color="tab:gray", alpha=0.12)
     plt.xlabel("Time t")
     plt.ylabel(f"<X_{args.target_site + 1}(t)>")
-    plt.title(f"Original non-Z2 AR X_{args.target_site + 1}(t), N={config.N}")
+    plt.title(f"Neural Galerkin TFIM X_{args.target_site + 1}(t), N={config.N}")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(x_path, dpi=150)
@@ -262,31 +226,6 @@ def main() -> None:
         opt_state=result["opt_state"],
     )
     print(f"Saved final wavefunction checkpoint to {checkpoint_path}")
-
-    if config.N <= args.save_statevector_max_sites:
-        basis_configs = enumerate_binary_configurations(config.N)
-        psi_by_time = []
-        for t_val in times:
-            psi_by_time.append(normalized_statevector(result["wavefunction"], config.N, t_val))
-        psi_xt = jnp.stack(psi_by_time, axis=0)
-
-        psi_path = output_dir / "final_psi_xt.npz"
-        np.savez(
-            psi_path,
-            times=np.asarray(jax.device_get(times)),
-            configurations=np.asarray(jax.device_get(basis_configs), dtype=np.int32),
-            psi=np.asarray(jax.device_get(psi_xt)),
-            psi_real=np.asarray(jax.device_get(jnp.real(psi_xt))),
-            psi_imag=np.asarray(jax.device_get(jnp.imag(psi_xt))),
-            probability=np.asarray(jax.device_get(jnp.abs(psi_xt) ** 2)),
-        )
-        print(f"Saved normalized psi(x,t) table to {psi_path}")
-    else:
-        print(
-            "Skipped exhaustive psi(x,t) export because "
-            f"N={config.N} exceeds --save-statevector-max-sites="
-            f"{args.save_statevector_max_sites}."
-        )
 
 
 if __name__ == "__main__":

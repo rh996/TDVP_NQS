@@ -51,6 +51,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--t-final", type=float, default=1.0)
     parser.add_argument("--time-steps", type=int, default=10)
     parser.add_argument(
+        "--measure-time-steps",
+        type=int,
+        default=None,
+        help="Number of time points used for post-training energy and observable plots.",
+    )
+    parser.add_argument(
+        "--measure-t-initial",
+        type=float,
+        default=None,
+        help="Initial time for post-training energy and observable plots.",
+    )
+    parser.add_argument(
+        "--measure-t-final",
+        type=float,
+        default=None,
+        help="Final time for post-training plots. Defaults to one training window beyond t_final.",
+    )
+    parser.add_argument(
         "--pretrain-steps",
         type=int,
         default=200,
@@ -112,6 +130,22 @@ def main() -> None:
         checkpoint_interval=200,
         seed=args.seed,
     )
+    measure_t_initial = (
+        config.t_initial if args.measure_t_initial is None else args.measure_t_initial
+    )
+    train_duration = config.t_final - config.t_initial
+    measure_t_final = (
+        config.t_final + train_duration
+        if args.measure_t_final is None
+        else args.measure_t_final
+    )
+    measure_time_steps = (
+        max(4 * config.time_steps, 50)
+        if args.measure_time_steps is None
+        else args.measure_time_steps
+    )
+    if measure_time_steps <= 0:
+        raise ValueError(f"measure_time_steps must be > 0, got {measure_time_steps}")
     ham = LongRangeTransverseIsingHamiltonian(
         J=config.J,
         h=config.h,
@@ -142,6 +176,8 @@ def main() -> None:
         f"residual_loss_mode={config.residual_loss_mode}, "
         f"pretrain_steps={config.pretrain_steps}, "
         f"pretrain_time_slices={config.time_steps}, "
+        f"measure_time_steps={measure_time_steps}, "
+        f"measure_interval=[{measure_t_initial}, {measure_t_final}], "
         f"lambda_ic={config.lambda_ic}"
     )
 
@@ -166,7 +202,7 @@ def main() -> None:
     print(f"Saved loss curve to {figure_path}")
 
     wf = result["wavefunction"]
-    times = jnp.linspace(config.t_initial, config.t_final, config.time_steps)
+    times = jnp.linspace(measure_t_initial, measure_t_final, measure_time_steps)
 
     print("\nMeasuring energy curve...")
     energy_curve, _, _ = sample_and_measure_energy_curve(
@@ -193,6 +229,9 @@ def main() -> None:
         color="tab:green",
         capsize=3,
     )
+    if measure_t_final > config.t_final:
+        plt.axvline(config.t_final, linestyle="--", linewidth=1.0, color="tab:gray")
+        plt.axvspan(config.t_final, measure_t_final, color="tab:gray", alpha=0.12)
     plt.xlabel("Time t")
     plt.ylabel("<H(t)>")
     plt.title(f"LRTFIM Autoregressive Energy, N={config.N}, alpha={args.alpha:g}")
@@ -236,6 +275,9 @@ def main() -> None:
     z_figure_path = output_dir / "z_trajectory.png"
     plt.figure(figsize=(9, 5))
     plt.plot(times, z_values, "o-", linewidth=1.5, markersize=4, color="tab:blue")
+    if measure_t_final > config.t_final:
+        plt.axvline(config.t_final, linestyle="--", linewidth=1.0, color="tab:gray")
+        plt.axvspan(config.t_final, measure_t_final, color="tab:gray", alpha=0.12)
     plt.xlabel("Time t")
     plt.ylabel(f"<Z_{args.target_site + 1}(t)>")
     plt.title(f"LRTFIM Autoregressive Z_{args.target_site + 1}(t), N={config.N}")
@@ -248,6 +290,9 @@ def main() -> None:
     x_figure_path = output_dir / "x_trajectory.png"
     plt.figure(figsize=(9, 5))
     plt.plot(times, x_values, "o-", linewidth=1.5, markersize=4, color="tab:orange")
+    if measure_t_final > config.t_final:
+        plt.axvline(config.t_final, linestyle="--", linewidth=1.0, color="tab:gray")
+        plt.axvspan(config.t_final, measure_t_final, color="tab:gray", alpha=0.12)
     plt.xlabel("Time t")
     plt.ylabel(f"<X_{args.target_site + 1}(t)>")
     plt.title(f"LRTFIM Autoregressive X_{args.target_site + 1}(t), N={config.N}")

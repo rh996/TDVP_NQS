@@ -12,7 +12,7 @@ from src.TDVP import (
 )
 from src.hamiltonian import TransverseIsingHamiltonian
 from src.sampler import metropolis_hastings_trajectory
-from src.wavefunction import AutoregressiveNQS, tSpinNQS
+from src.wavefunction import AutoregressiveNQS, NeuralGalerkinNQS, tSpinNQS
 
 
 def _make_config():
@@ -246,3 +246,44 @@ def test_train_loop_supports_unique_autoregressive_samples():
     assert len(result["metrics_history"]["loss"]) == 1
     assert len(result["metrics_history"]["ar_unique_count"]) == 1
     assert result["metrics_history"]["ar_unique_fraction"][0] <= 1.0
+
+
+def test_train_loop_supports_neural_galerkin_mcmc_variance_loss():
+    config = TrainingConfig(
+        N=3,
+        J=-1.0,
+        h=0.5,
+        Num_boxes=1,
+        emb_dim=8,
+        num_heads=2,
+        head_dim=4,
+        num_galerkin_basis=2,
+        num_galerkin_modes=2,
+        learning_rate=1e-3,
+        n_steps=1,
+        n_samples_per_chain=2,
+        burn_in=1,
+        thinning=1,
+        n_chains=2,
+        time_steps=2,
+        random_time_collocation=True,
+        residual_loss_mode="variance",
+        seed=0,
+    )
+    wf = NeuralGalerkinNQS(
+        N=config.N,
+        Num_boxes=config.Num_boxes,
+        emb_dim=config.emb_dim,
+        num_heads=config.num_heads,
+        head_dim=config.head_dim,
+        num_basis=config.num_galerkin_basis,
+        num_modes=config.num_galerkin_modes,
+        rngs=nnx.Rngs(config.seed),
+    )
+
+    result = train_loop(config, verbose=False, initial_wavefunction=wf)
+
+    assert result["final_configurations"].shape == (config.n_chains, config.N)
+    assert len(result["metrics_history"]["loss"]) == 1
+    assert jnp.isfinite(jnp.asarray(result["metrics_history"]["loss"][0]))
+    assert len(result["metrics_history"]["acceptance_rate"]) == 1
